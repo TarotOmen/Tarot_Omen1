@@ -65,11 +65,6 @@ app.post('/api/interpret', async (req, res) => {
       return res.status(500).json({ error: 'Server is not configured with an API key yet.' });
     }
 
-    const clientKey = req.ip || 'unknown';
-    if (rateLimited(clientKey)) {
-      return res.status(429).json({ error: 'Too many readings requested. Please wait a few minutes.' });
-    }
-
     const { question, cards } = req.body || {};
 
     if (typeof question !== 'string' || question.trim().length === 0 || question.length > 400) {
