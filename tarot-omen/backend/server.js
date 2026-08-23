@@ -272,8 +272,9 @@ async function runTelegramBot() {
                 "Content-Type": "application/json"
               },
               body: JSON.stringify({
-                text: text
-              })
+  question: text,
+  cards: drawThreeCards()
+})
             }
           );
 
