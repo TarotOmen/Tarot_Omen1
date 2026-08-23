@@ -123,7 +123,115 @@ app.post('/api/interpret', async (req, res) => {
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
+// ===== TELEGRAM BOT =====
 
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+
+async function telegramSendMessage(chatId, text) {
+  await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: text
+    })
+  });
+}
+
+async function telegramGetUpdates(offset = 0) {
+  const response = await fetch(
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?timeout=30&offset=${offset}`
+  );
+
+  return await response.json();
+}
+
+async function runTelegramBot() {
+  if (!TELEGRAM_BOT_TOKEN) {
+    console.error("TELEGRAM_BOT_TOKEN is not set");
+    return;
+  }
+
+  let offset = 0;
+
+  console.log("Telegram bot starting...");
+
+  while (true) {
+    try {
+      const data = await telegramGetUpdates(offset);
+
+      if (!data.ok) {
+        console.error("Telegram error:", data);
+        await new Promise(r => setTimeout(r, 5000));
+        continue;
+      }
+
+      for (const update of data.result) {
+        offset = update.update_id + 1;
+
+        const message = update.message;
+
+        if (!message || !message.text) continue;
+
+        const chatId = message.chat.id;
+        const text = message.text;
+
+        if (text === "/start") {
+          await telegramSendMessage(
+            chatId,
+            "Привет! Напиши свой вопрос для расклада."
+          );
+          continue;
+        }
+
+        try {
+          const interpretation = await fetch(
+            `http://127.0.0.1:${PORT}/api/interpret`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({
+                text: text
+              })
+            }
+          );
+
+          const result = await interpretation.json();
+
+          if (!interpretation.ok) {
+            throw new Error(result.error || "Interpretation failed");
+          }
+
+          const answer =
+            result.interpretation ||
+            result.text ||
+            result.answer ||
+            JSON.stringify(result);
+
+          await telegramSendMessage(chatId, answer);
+
+        } catch (err) {
+          console.error("Telegram interpretation error:", err);
+
+          await telegramSendMessage(
+            chatId,
+            "Не удалось получить интерпретацию. Попробуй ещё раз."
+          );
+        }
+      }
+
+    } catch (err) {
+      console.error("Telegram polling error:", err);
+      await new Promise(r => setTimeout(r, 5000));
+    }
+  }
+}
+
+runTelegramBot();
 app.listen(PORT, () => {
   console.log(`[tarot-omen] backend listening on port ${PORT}`);
 });
