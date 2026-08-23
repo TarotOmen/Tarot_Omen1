@@ -65,11 +65,16 @@ app.post('/api/interpret', async (req, res) => {
       return res.status(500).json({ error: 'Server is not configured with an API key yet.' });
     }
 
-    const { question, cards } = req.body || {};
+    const body = req.body || {};
+const question = typeof body.question === 'string'
+  ? body.question.trim()
+  : String(body.question || '').trim();
 
-    if (typeof question !== 'string' || question.trim().length === 0 || question.length > 400) {
-      return res.status(400).json({ error: 'Invalid question.' });
-    }
+const cards = body.cards;
+
+if (!question || question.length > 400) {
+  return res.status(400).json({ error: 'Invalid question.' });
+}
     if (!Array.isArray(cards) || cards.length !== 3) {
       return res.status(400).json({ error: 'Exactly three cards are required.' });
     }
