@@ -10,7 +10,7 @@ interface Props {
   onAskAnother: () => void;
 }
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? '';
+const API_BASE = import.meta.env.VITE_API_BASE_URL || 'https://tarot-omen1.onrender.com';
 
 export function InterpretationScreen({ question, cards, onAskAnother }: Props) {
   const [interpretation, setInterpretation] = useState<string | null>(null);
