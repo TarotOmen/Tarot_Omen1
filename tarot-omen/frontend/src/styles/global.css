@@ -1,0 +1,399 @@
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;1,400&family=Manrope:wght@400;500;600;700&display=swap');
+
+:root {
+  --bg: #0b0a10;
+  --bg-elevated: #131019;
+  --ink: #f3efe6;
+  --ink-dim: #9c96a8;
+  --gold: #c9a55c;
+  --gold-soft: rgba(201, 165, 92, 0.18);
+  --line: rgba(243, 239, 230, 0.08);
+  --plum: #4a2f52;
+  --radius: 18px;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: radial-gradient(ellipse 120% 80% at 50% -10%, #1c1626 0%, var(--bg) 55%);
+  color: var(--ink);
+  font-family: 'Manrope', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+}
+
+.app {
+  min-height: 100vh;
+  padding-top: calc(var(--safe-top) + 20px);
+  padding-bottom: calc(var(--safe-bottom) + 24px);
+  display: flex;
+  flex-direction: column;
+}
+
+.brand {
+  text-align: center;
+  letter-spacing: 0.32em;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--gold);
+  text-transform: uppercase;
+  margin: 0 0 6px;
+}
+
+.brand-hair {
+  width: 36px;
+  height: 1px;
+  background: var(--gold);
+  opacity: 0.5;
+  margin: 0 auto 28px;
+}
+
+.screen {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 0 22px;
+  animation: fadeIn 480ms ease both;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/* ---------- Question screen ---------- */
+
+.question-screen {
+  justify-content: center;
+  gap: 28px;
+}
+
+.question-title {
+  font-family: 'Cormorant Garamond', serif;
+  font-weight: 500;
+  font-size: 38px;
+  line-height: 1.15;
+  text-align: center;
+  margin: 0;
+}
+
+.question-input {
+  width: 100%;
+  min-height: 120px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--ink);
+  font-family: 'Manrope', sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+  padding: 18px;
+  resize: none;
+  outline: none;
+  transition: border-color 200ms ease;
+}
+
+.question-input::placeholder {
+  color: var(--ink-dim);
+}
+
+.question-input:focus {
+  border-color: var(--gold-soft);
+  border-color: rgba(201, 165, 92, 0.5);
+}
+
+.reveal-btn {
+  appearance: none;
+  border: 1px solid var(--gold);
+  background: transparent;
+  color: var(--gold);
+  font-family: 'Manrope', sans-serif;
+  font-weight: 700;
+  letter-spacing: 0.22em;
+  font-size: 13px;
+  text-transform: uppercase;
+  padding: 16px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 220ms ease, color 220ms ease, transform 120ms ease;
+}
+
+.reveal-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.reveal-btn:not(:disabled):active {
+  transform: scale(0.98);
+}
+
+.reveal-btn:not(:disabled):hover {
+  background: var(--gold);
+  color: #14100a;
+}
+
+.hint {
+  text-align: center;
+  color: var(--ink-dim);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* ---------- Reveal screen ---------- */
+
+.reveal-screen {
+  justify-content: center;
+  align-items: center;
+  gap: 34px;
+}
+
+.deck-stage {
+  position: relative;
+  width: 148px;
+  height: 220px;
+}
+
+.deck-card {
+  position: absolute;
+  inset: 0;
+  border-radius: 12px;
+  background:
+    repeating-linear-gradient(135deg, transparent 0 6px, rgba(201,165,92,0.06) 6px 7px),
+    linear-gradient(160deg, #1a1523, #0e0b13 70%);
+  border: 1px solid rgba(201, 165, 92, 0.35);
+  box-shadow: 0 20px 40px -20px rgba(0,0,0,0.7);
+}
+
+.deck-card::after {
+  content: '';
+  position: absolute;
+  inset: 10px;
+  border: 1px solid rgba(201, 165, 92, 0.25);
+  border-radius: 8px;
+}
+
+.deck-card.c0 { transform: translate(0, 0) rotate(0deg); animation: shuffleA 1.4s ease-in-out infinite; }
+.deck-card.c1 { transform: translate(4px, 3px) rotate(-3deg); animation: shuffleB 1.4s ease-in-out infinite; }
+.deck-card.c2 { transform: translate(-4px, 6px) rotate(3deg); animation: shuffleC 1.4s ease-in-out infinite; }
+
+@keyframes shuffleA {
+  0%, 100% { transform: translate(0,0) rotate(0deg); }
+  50% { transform: translate(-10px, -6px) rotate(-6deg); }
+}
+@keyframes shuffleB {
+  0%, 100% { transform: translate(4px,3px) rotate(-3deg); }
+  50% { transform: translate(12px, -2px) rotate(4deg); }
+}
+@keyframes shuffleC {
+  0%, 100% { transform: translate(-4px,6px) rotate(3deg); }
+  50% { transform: translate(-14px, 2px) rotate(-5deg); }
+}
+
+.deck-stage.settled .deck-card { animation: none; transform: none; }
+
+.reveal-status {
+  color: var(--ink-dim);
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.spread {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  width: 100%;
+}
+
+.spread-slot {
+  flex: 1;
+  max-width: 108px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.spread-label {
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+  text-align: center;
+  min-height: 26px;
+}
+
+.tarot-card {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 5 / 8;
+  perspective: 900px;
+}
+
+.tarot-card-inner {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  transform-style: preserve-3d;
+  transition: transform 720ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+.tarot-card.flipped .tarot-card-inner {
+  transform: rotateY(180deg);
+}
+
+.tarot-card-face {
+  position: absolute;
+  inset: 0;
+  border-radius: 10px;
+  backface-visibility: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 8px;
+}
+
+.tarot-card-back {
+  background:
+    repeating-linear-gradient(135deg, transparent 0 6px, rgba(201,165,92,0.07) 6px 7px),
+    linear-gradient(160deg, #1a1523, #0e0b13 70%);
+  border: 1px solid rgba(201, 165, 92, 0.35);
+}
+
+.tarot-card-front {
+  background: linear-gradient(165deg, #16121e, #0b0a10 75%);
+  border: 1px solid rgba(201, 165, 92, 0.55);
+  transform: rotateY(180deg);
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tarot-card.reversed .tarot-card-front {
+  transform: rotateY(180deg) rotate(180deg);
+}
+
+.tarot-card-name {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 14.5px;
+  font-weight: 600;
+  line-height: 1.15;
+  color: var(--ink);
+}
+
+.tarot-card-orientation {
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--gold);
+}
+
+.tarot-card-glyph {
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--gold);
+  border-radius: 50%;
+  opacity: 0.55;
+}
+
+/* ---------- Interpretation screen ---------- */
+
+.interp-screen {
+  gap: 24px;
+  padding-top: 6px;
+}
+
+.interp-question {
+  font-family: 'Cormorant Garamond', serif;
+  font-style: italic;
+  font-size: 20px;
+  line-height: 1.4;
+  color: var(--ink-dim);
+  text-align: center;
+  margin: 0;
+}
+
+.interp-cards {
+  display: flex;
+  gap: 10px;
+}
+
+.interp-cards .spread-slot { max-width: none; }
+
+.interp-body {
+  background: var(--bg-elevated);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 22px;
+  font-size: 15.5px;
+  line-height: 1.7;
+  color: var(--ink);
+  white-space: pre-wrap;
+}
+
+.interp-loading {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 40px 0;
+  color: var(--ink-dim);
+  font-size: 13px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.spinner {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 2px solid rgba(201,165,92,0.25);
+  border-top-color: var(--gold);
+  animation: spin 900ms linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.interp-error {
+  color: #e6a5a5;
+  font-size: 14px;
+  text-align: center;
+  line-height: 1.6;
+}
+
+.actions {
+  display: flex;
+  gap: 12px;
+  margin-top: auto;
+  padding-top: 10px;
+}
+
+.btn-secondary, .btn-primary {
+  flex: 1;
+  padding: 15px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  cursor: pointer;
+  border: 1px solid var(--gold);
+  background: transparent;
+  color: var(--gold);
+}
+
+.btn-primary {
+  background: var(--gold);
+  color: #14100a;
+}
+
+.btn-secondary:active, .btn-primary:active {
+  transform: scale(0.98);
+}
