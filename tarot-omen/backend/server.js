@@ -171,7 +171,7 @@ async function runTelegramBot() {
         if (!message || !message.text) continue;
 
         const chatId = message.chat.id;
-        const text = message.text;
+        const text = String(message.text || "").trim();
 
         if (text === "/start") {
           await telegramSendMessage(
