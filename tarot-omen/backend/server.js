@@ -58,9 +58,6 @@ QUESTION — not a generic listing of card meanings. Specifically:
 
 app.post('/api/interpret', async (req, res) => {
   try {
-    if (!anthropic) {
-      return res.status(500).json({ error: 'Server is not configured with an API key yet.' });
-    }
 
     const body = req.body || {};
 const question = typeof body.question === 'string'
