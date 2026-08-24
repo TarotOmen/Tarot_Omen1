@@ -3,16 +3,14 @@ import express from 'express';
 import cors from 'cors';
 
 const PORT = process.env.PORT || 8787;
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 
-if (!ANTHROPIC_API_KEY) {
+if (!GEMINI_API_KEY) {
   console.warn(
-    '[tarot-omen] WARNING: ANTHROPIC_API_KEY is not set. /api/interpret will return an error until it is configured.'
+    '[tarot-omen] WARNING: GEMINI_API_KEY is not set.'
   );
 }
-
-const anthropic = ANTHROPIC_API_KEY ? new Anthropic({ apiKey: ANTHROPIC_API_KEY }) : null;
 
 const app = express();
 app.use(express.json({ limit: '20kb' }));
