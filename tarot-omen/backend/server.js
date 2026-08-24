@@ -466,7 +466,6 @@ app.listen(PORT, () => {
   console.log(`[tarot-omen] backend listening on port ${PORT}`);
 });
 import 'dotenv/config';
-import cors from 'cors';
 
 const PORT = process.env.PORT || 8787;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
