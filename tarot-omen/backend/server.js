@@ -222,7 +222,19 @@ async function telegramGetUpdates(offset = 0) {
     `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?timeout=30&offset=${offset}`
   );
 
-  return await response.json();
+  const data = await response.json();
+
+  if (!response.ok || !data.ok) {
+    if (data.error_code === 409) {
+      throw new Error(
+        "Telegram 409 Conflict: another bot instance is already polling getUpdates."
+      );
+    }
+
+    throw new Error(data.description || "Telegram getUpdates failed");
+  }
+
+  return data;
 }
 
 async function runTelegramBot() {
