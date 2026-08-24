@@ -467,7 +467,6 @@ app.listen(PORT, () => {
 });
 import 'dotenv/config';
 
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 
 if (!GEMINI_API_KEY) {
