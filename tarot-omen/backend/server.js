@@ -432,7 +432,6 @@ async function runTelegramBot() {
           const cards = drawThreeCards();
 
           // Keep the animation on screen while Gemini is generating the reading.
-          await telegramSendShuffleGif(chatId);
 
           // Generate the interpretation directly. This avoids an unnecessary
           // Telegram -> HTTP -> Express -> Gemini round trip.
