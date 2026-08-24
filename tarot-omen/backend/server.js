@@ -95,18 +95,54 @@ if (!question || question.length > 400) {
 
     const userMessage = `User's question:\n"${question.trim()}"\n\nDrawn spread:\n\n${cardBlock}`;
 
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 700,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: 'user', content: userMessage }],
-    });
+    const response = await fetch(
+  'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
+  {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-goog-api-key': GEMINI_API_KEY
+    },
+    body: JSON.stringify({
+      systemInstruction: {
+        parts: [
+          {
+            text: SYSTEM_PROMPT
+          }
+        ]
+      },
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: userMessage
+            }
+          ]
+        }
+      ],
+      generationConfig: {
+        maxOutputTokens: 700
+      }
+    })
+  }
+);
 
-    const interpretation = response.content
-      .filter((block) => block.type === 'text')
-      .map((block) => block.text)
-      .join('\n')
-      .trim();
+const responseData = await response.json();
+
+if (!response.ok) {
+  console.error('[tarot-omen] Gemini API error:', responseData);
+
+  return res.status(502).json({
+    error: responseData?.error?.message || 'Gemini API request failed.'
+  });
+}
+
+const interpretation = responseData?.candidates?.[0]?.content?.parts
+  ?.filter((part) => typeof part.text === 'string')
+  .map((part) => part.text)
+  .join('\n')
+  .trim();
 
     if (!interpretation) {
       return res.status(502).json({ error: 'The reading came back empty. Please try again.' });
