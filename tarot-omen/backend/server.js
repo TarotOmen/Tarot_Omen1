@@ -129,7 +129,7 @@ if (!question || question.length > 400) {
         }
       ],
       generationConfig: {
-        maxOutputTokens: 1400
+        maxOutputTokens: 3000
       }
     })
   }
