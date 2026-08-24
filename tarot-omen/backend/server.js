@@ -6,8 +6,10 @@ const PORT = process.env.PORT || 8787;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const RENDER_EXTERNAL_URL =
-  process.env.RENDER_EXTERNAL_URL || 'https://tarot-omen1.onrender.com';
+const PUBLIC_URL =
+  process.env.PUBLIC_URL ||
+  process.env.RENDER_EXTERNAL_URL ||
+  '';
 
 if (!GEMINI_API_KEY) {
   console.warn('[tarot-omen] WARNING: GEMINI_API_KEY is not set.');
@@ -21,7 +23,6 @@ const app = express();
 app.use(express.json({ limit: '20kb' }));
 app.use(cors({ origin: ALLOWED_ORIGIN }));
 
-// Very small in-memory throttle: max 12 requests / 10 minutes per client key.
 const hits = new Map();
 const WINDOW_MS = 10 * 60 * 1000;
 const MAX_HITS = 12;
@@ -100,8 +101,7 @@ async function generateInterpretation(question, cards) {
     )
     .join('\n\n');
 
-  const userMessage =
-    `User's question:\n"${question.trim()}"\n\nDrawn spread:\n\n${cardBlock}`;
+  const userMessage = `User's question:\n"${question.trim()}"\n\nDrawn spread:\n\n${cardBlock}`;
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 60000);
@@ -143,9 +143,7 @@ async function generateInterpretation(question, cards) {
     }
 
     if (!response.ok) {
-      const message =
-        responseData?.error?.message ||
-        `Gemini API HTTP ${response.status}`;
+      const message = responseData?.error?.message || `Gemini API HTTP ${response.status}`;
       throw new Error(message);
     }
 
@@ -175,17 +173,17 @@ async function generateInterpretation(question, cards) {
   }
 }
 
+
 app.post('/api/interpret', async (req, res) => {
   try {
     const body = req.body || {};
-    const question =
-      typeof body.question === 'string'
-        ? body.question.trim()
-        : String(body.question || '').trim();
+    const question = typeof body.question === 'string'
+      ? body.question.trim()
+      : String(body.question || '').trim();
 
     const cards = body.cards;
-
     const interpretation = await generateInterpretation(question, cards);
+
     res.json({ interpretation });
   } catch (err) {
     console.error('[tarot-omen] /api/interpret failed:', err);
@@ -275,83 +273,68 @@ function drawThreeCards() {
   }));
 }
 
-async function telegramSendMessage(chatId, text) {
+
+// ===== TELEGRAM BOT =====
+
+async function telegramRequest(method, payload) {
   const response = await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`,
     {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text
-      })
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
     }
   );
 
-  if (!response.ok) {
-    throw new Error(`Telegram sendMessage failed: ${await response.text()}`);
+  const raw = await response.text();
+  let data = null;
+
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error(`Telegram ${method} returned invalid JSON (HTTP ${response.status}).`);
   }
+
+  if (!response.ok || !data.ok) {
+    throw new Error(
+      `Telegram ${method} failed: ${data?.description || raw || `HTTP ${response.status}`}`
+    );
+  }
+
+  return data;
+}
+
+async function telegramSendMessage(chatId, text) {
+  return telegramRequest('sendMessage', {
+    chat_id: chatId,
+    text: String(text)
+  });
 }
 
 function tarotImageCode(name) {
   const major = {
-    "Шут": "ar00",
-    "Маг": "ar01",
-    "Верховная Жрица": "ar02",
-    "Императрица": "ar03",
-    "Император": "ar04",
-    "Иерофант": "ar05",
-    "Влюблённые": "ar06",
-    "Колесница": "ar07",
-    "Сила": "ar08",
-    "Отшельник": "ar09",
-    "Колесо Фортуны": "ar10",
-    "Справедливость": "ar11",
-    "Повешенный": "ar12",
-    "Смерть": "ar13",
-    "Умеренность": "ar14",
-    "Дьявол": "ar15",
-    "Башня": "ar16",
-    "Звезда": "ar17",
-    "Луна": "ar18",
-    "Солнце": "ar19",
-    "Суд": "ar20",
-    "Мир": "ar21"
+    "Шут":"ar00","Маг":"ar01","Верховная Жрица":"ar02","Императрица":"ar03",
+    "Император":"ar04","Иерофант":"ar05","Влюблённые":"ar06","Колесница":"ar07",
+    "Сила":"ar08","Отшельник":"ar09","Колесо Фортуны":"ar10","Справедливость":"ar11",
+    "Повешенный":"ar12","Смерть":"ar13","Умеренность":"ar14","Дьявол":"ar15",
+    "Башня":"ar16","Звезда":"ar17","Луна":"ar18","Солнце":"ar19","Суд":"ar20","Мир":"ar21"
   };
 
   if (major[name]) return major[name];
 
   const suitMap = {
-    "Жезлов": "wa",
-    "Кубков": "cu",
-    "Мечей": "sw",
-    "Пентаклей": "pe"
+    "Жезлов":"wa", "Кубков":"cu", "Мечей":"sw", "Пентаклей":"pe"
   };
 
   const rankMap = {
-    "Туз": "ac",
-    "Паж": "pa",
-    "Рыцарь": "kn",
-    "Королева": "qu",
-    "Король": "ki",
-    "Двойка": "02",
-    "Тройка": "03",
-    "Четвёрка": "04",
-    "Пятёрка": "05",
-    "Шестёрка": "06",
-    "Семёрка": "07",
-    "Восьмёрка": "08",
-    "Девятка": "09",
-    "Десятка": "10"
+    "Туз":"ac", "Паж":"pa", "Рыцарь":"kn", "Королева":"qu", "Король":"ki",
+    "Двойка":"02", "Тройка":"03", "Четвёрка":"04", "Пятёрка":"05",
+    "Шестёрка":"06", "Семёрка":"07", "Восьмёрка":"08", "Девятка":"09", "Десятка":"10"
   };
 
   for (const [rank, rankCode] of Object.entries(rankMap)) {
     for (const [suit, suitCode] of Object.entries(suitMap)) {
-      if (name === `${rank} ${suit}`) {
-        return `${suitCode}${rankCode}`;
-      }
+      if (name === `${rank} ${suit}`) return `${suitCode}${rankCode}`;
     }
   }
 
@@ -366,40 +349,57 @@ async function telegramSendCards(chatId, cards) {
       throw new Error(`No image mapping for Tarot card: ${card.name}`);
     }
 
-    const imageUrl =
-      `https://petaloverflow.github.io/tarot-api/cards/${code}.jpg`;
-
+    // Telegram was failing when it tried to fetch the external GitHub Pages URL
+    // directly. The local proxy below makes the image come from our Render service.
+    const imageUrl = `${PUBLIC_URL.replace(/\/$/, '')}/tarot-card/${code}.jpg`;
     const orientation =
       card.orientation === 'reversed' ? 'перевёрнутая' : 'прямая';
 
     return {
       type: 'photo',
       media: imageUrl,
-      caption:
-        `${index + 1}. ${card.name}\n${orientation}\n${card.position}`
+      caption: `${index + 1}. ${card.name}\n${orientation}\n${card.position}`
     };
   });
 
-  const response = await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMediaGroup`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        media
-      })
-    }
-  );
-
-  if (!response.ok) {
-    throw new Error(
-      `Telegram sendMediaGroup failed: ${await response.text()}`
-    );
+  if (!PUBLIC_URL) {
+    throw new Error('PUBLIC_URL is not configured; card images are unavailable.');
   }
+
+  return telegramRequest('sendMediaGroup', {
+    chat_id: chatId,
+    media
+  });
 }
 
-async function handleTelegramUpdate(update) {
+app.get('/tarot-card/:code.jpg', async (req, res) => {
+  const code = String(req.params.code || '');
+
+  if (!/^(ar(?:0[0-9]|1[0-9]|2[01])|(?:wa|cu|sw|pe)(?:ac|pa|kn|qu|ki|0[2-9]|10))$/.test(code)) {
+    return res.status(400).send('Invalid card code.');
+  }
+
+  try {
+    const sourceUrl = `https://petaloverflow.github.io/tarot-api/cards/${code}.jpg`;
+    const response = await fetch(sourceUrl);
+
+    if (!response.ok) {
+      return res.status(502).send('Card image source unavailable.');
+    }
+
+    const contentType = response.headers.get('content-type') || 'image/jpeg';
+    const buffer = Buffer.from(await response.arrayBuffer());
+
+    res.set('Content-Type', contentType);
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.send(buffer);
+  } catch (err) {
+    console.error('[tarot-omen] card proxy failed:', err);
+    res.status(502).send('Card image unavailable.');
+  }
+});
+
+async function processTelegramUpdate(update) {
   const message = update?.message;
 
   if (!message || !message.text) {
@@ -407,99 +407,117 @@ async function handleTelegramUpdate(update) {
   }
 
   const chatId = message.chat.id;
-  const text = String(message.text || "").trim();
+  const text = String(message.text || '').trim();
 
   if (!text) {
     return;
   }
 
-  if (text === "/start") {
+  if (text === '/start') {
     await telegramSendMessage(
       chatId,
-      "Привет! Напиши свой вопрос для расклада."
+      'Привет! Напиши свой вопрос для расклада.'
+    );
+    return;
+  }
+
+  const key = String(chatId);
+
+  if (rateLimited(key)) {
+    await telegramSendMessage(
+      chatId,
+      'Слишком много запросов подряд. Попробуй немного позже.'
     );
     return;
   }
 
   try {
     const cards = drawThreeCards();
+
+    // First generate and send the reading. Card-image delivery must never
+    // prevent the user from receiving the actual answer.
     const answer = await generateInterpretation(text, cards);
 
-    await telegramSendCards(chatId, cards);
     await telegramSendMessage(
       chatId,
       `🔮 Интерпретация\n\n${answer}`
     );
+
+    // Cards are supplementary. If Telegram cannot fetch an image, send the
+    // card names/orientations instead of turning the whole request into an error.
+    try {
+      await telegramSendCards(chatId, cards);
+    } catch (cardError) {
+      console.warn(
+        '[tarot-omen] Card images were not delivered:',
+        cardError?.message || cardError
+      );
+
+      const cardText = cards
+        .map((card, index) => {
+          const orientation =
+            card.orientation === 'reversed' ? 'перевёрнутая' : 'прямая';
+          return `${index + 1}. ${card.name} — ${orientation}\n${card.position}`;
+        })
+        .join('\n\n');
+
+      await telegramSendMessage(
+        chatId,
+        `Карты расклада:\n\n${cardText}`
+      );
+    }
   } catch (err) {
-    console.error("Telegram interpretation error:", err);
+    console.error('[tarot-omen] Telegram interpretation error:', err);
 
     try {
       await telegramSendMessage(
         chatId,
-        "Не удалось получить интерпретацию. Попробуй ещё раз."
+        'Не удалось получить интерпретацию. Попробуй ещё раз.'
       );
-    } catch (sendErr) {
-      console.error("Telegram error message failed:", sendErr);
+    } catch (sendError) {
+      console.error('[tarot-omen] Telegram error message failed:', sendError);
     }
   }
 }
 
-// ===== TELEGRAM WEBHOOK =====
-// Webhook is used instead of getUpdates polling.
-// This completely removes Telegram 409 Conflict caused by competing pollers.
-
 app.post('/telegram-webhook', (req, res) => {
-  // Telegram only needs a fast 200 response.
+  // Acknowledge Telegram immediately, then process the update.
   res.sendStatus(200);
 
-  handleTelegramUpdate(req.body).catch((err) => {
-    console.error("Telegram webhook update error:", err);
+  processTelegramUpdate(req.body).catch((err) => {
+    console.error('[tarot-omen] Telegram update processing failed:', err);
   });
 });
 
-async function configureTelegramWebhook() {
+async function setupTelegram() {
   if (!TELEGRAM_BOT_TOKEN) {
     return;
   }
 
-  const webhookUrl = `${RENDER_EXTERNAL_URL.replace(/\/$/, '')}/telegram-webhook`;
-
-  const response = await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setWebhook`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        url: webhookUrl,
-        drop_pending_updates: false
-      })
-    }
-  );
-
-  const data = await response.json();
-
-  if (!response.ok || !data.ok) {
-    throw new Error(
-      data.description || `Telegram setWebhook failed (HTTP ${response.status})`
+  if (!PUBLIC_URL) {
+    console.warn(
+      '[tarot-omen] PUBLIC_URL/RENDER_EXTERNAL_URL is not set. Telegram webhook was not configured.'
     );
+    return;
   }
 
-  console.log(`[tarot-omen] Telegram webhook set: ${webhookUrl}`);
-}
+  const webhookUrl = `${PUBLIC_URL.replace(/\/$/, '')}/telegram-webhook`;
 
-async function start() {
-  app.listen(PORT, async () => {
-    console.log(`[tarot-omen] backend listening on port ${PORT}`);
-
-    try {
-      await configureTelegramWebhook();
-      console.log("[tarot-omen] Telegram bot ready.");
-    } catch (err) {
-      console.error("[tarot-omen] Telegram webhook setup failed:", err);
-    }
+  await telegramRequest('setWebhook', {
+    url: webhookUrl,
+    drop_pending_updates: true
   });
+
+  console.log(`[tarot-omen] Telegram webhook set: ${webhookUrl}`);
+  console.log('[tarot-omen] Telegram bot ready.');
 }
 
-start();
+app.listen(PORT, async () => {
+  console.log(`[tarot-omen] backend listening on port ${PORT}`);
+
+  try {
+    await setupTelegram();
+  } catch (err) {
+    console.error('[tarot-omen] Telegram setup failed:', err);
+  }
+});
