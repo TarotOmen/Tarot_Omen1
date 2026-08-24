@@ -466,7 +466,6 @@ app.listen(PORT, () => {
   console.log(`[tarot-omen] backend listening on port ${PORT}`);
 });
 import 'dotenv/config';
-import express from 'express';
 import cors from 'cors';
 
 const PORT = process.env.PORT || 8787;
