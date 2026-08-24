@@ -445,3 +445,23 @@ async function runTelegramBot() {
           await telegramSendMessage(chatId, `🔮 Интерпретация\n\n${answer}`);
 
         } catch (err) {
+          console.error("Telegram interpretation error:", err);
+
+          await telegramSendMessage(
+            chatId,
+            "Не удалось получить интерпретацию. Попробуй ещё раз."
+          );
+        }
+      }
+
+    } catch (err) {
+      console.error("Telegram polling error:", err);
+      await new Promise(r => setTimeout(r, 5000));
+    }
+  }
+}
+
+runTelegramBot();
+app.listen(PORT, () => {
+  console.log(`[tarot-omen] backend listening on port ${PORT}`);
+});
