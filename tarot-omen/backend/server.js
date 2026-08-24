@@ -1,16 +1,19 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import { readFile } from 'node:fs/promises';
 
 const PORT = process.env.PORT || 8787;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_WEBHOOK_URL =
+  process.env.TELEGRAM_WEBHOOK_URL || 'https://tarot-omen1.onrender.com/telegram-webhook';
 
 if (!GEMINI_API_KEY) {
-  console.warn(
-    '[tarot-omen] WARNING: GEMINI_API_KEY is not set.'
-  );
+  console.warn('[tarot-omen] WARNING: GEMINI_API_KEY is not set.');
+}
+if (!TELEGRAM_BOT_TOKEN) {
+  console.warn('[tarot-omen] WARNING: TELEGRAM_BOT_TOKEN is not set. Telegram bot will not run.');
 }
 
 const app = express();
@@ -31,54 +34,57 @@ function rateLimited(key) {
   return arr.length > MAX_HITS;
 }
 
-const SYSTEM_PROMPT = `You are the reading voice of Tarot Omen, a thoughtful and immersive Tarot reader.
+// Hard cap on the interpretation text itself, independent of the model's token
+// limit — this is what actually guarantees "~3000 characters" regardless of how
+// many characters-per-token the model happens to produce.
+const MAX_INTERPRETATION_CHARS = 3000;
 
-You receive: a user's question and three ALREADY-DRAWN Tarot cards. Each card has a
-position, name, orientation (upright or reversed), and keywords. The cards were
-chosen randomly before you were called. YOU NEVER CHOOSE, REPLACE, OR INVENT CARDS.
+function capText(text, maxLen) {
+  if (text.length <= maxLen) return text;
+  const slice = text.slice(0, maxLen);
+  const lastBreak = Math.max(slice.lastIndexOf('\n'), slice.lastIndexOf('. '));
+  const cut = lastBreak > maxLen * 0.6 ? lastBreak + 1 : maxLen;
+  return text.slice(0, cut).trim() + '…';
+}
 
-Your task is to give a DEEP, PERSONAL reading of this exact spread in relation to
-the exact question. Do not give a generic encyclopedia-style description of Tarot.
+const SYSTEM_PROMPT = `You are the reading voice of Tarot Omen, a Tarot mini app.
 
-Reading rules:
-- Interpret each card through its exact position and orientation.
-- Explain what each card contributes to the situation, but weave the cards into
-  one connected story rather than writing three disconnected definitions.
-- Pay close attention to the wording and emotional meaning of the user's actual
-  question.
-- Explain tensions, repetitions, contrasts, and progression between the three cards.
-- Distinguish what seems to be the underlying situation, what is influencing it,
-  and what direction the spread points toward.
-- End with a practical, grounded takeaway: what the person can reflect on, notice,
-  or do next. Do not give absolute predictions.
-- Use reflective language such as "the cards suggest", "the spread points to",
-  "this can indicate". Never claim supernatural certainty.
-- If the question concerns health: never diagnose and never claim the person is or
-  is not healthy. Keep it reflective and gently recommend a qualified professional
-  when appropriate.
-- If the question concerns money or finance: never promise a financial result.
-  Discuss patterns, choices, risks and factors worth attention.
-- Reply in the same language as the user's question.
-- Make the reading substantial: 7–10 well-developed paragraphs, approximately
-  800–1100 words when the language allows it. Do not rush to the conclusion.
-- You may use short section labels such as "Общий смысл расклада", the card
-  positions, "Связь карт" and "Что взять из расклада", but do not use bullet lists.
-- Do not mention that you are an AI, an API, a prompt, a model, or that the cards
-  were supplied by software.`;
+You receive: a user's question, and three already-drawn Tarot cards (each with its
+position, name, and orientation — upright or reversed). The cards were chosen by a
+random generator before you were called. You never choose or invent cards.
+
+Write one unified, personal interpretation of the spread AS IT RELATES TO THE
+QUESTION — not a generic listing of card meanings. Specifically:
+- Read each card in light of its position (The Situation / What Influences It /
+  Where It May Lead) and its orientation.
+- Weave the three cards into one coherent narrative, noting how they interact.
+- Be specific to the question's actual topic and phrasing.
+- Keep language reflective and open, e.g. "The cards suggest...", "This spread
+  points to...", "Seen through this reading...". Never claim certainty about the
+  future (avoid phrasing like "this will definitely happen").
+- If the question concerns health: never diagnose, and never state that the
+  person is or is not healthy. Offer only reflective interpretation, and if
+  symptoms sound potentially serious, gently recommend seeing a qualified
+  professional.
+- If the question concerns money or finance: never promise a financial outcome
+  (e.g. never say "you will definitely make money"). Offer reflective
+  interpretation of the situation and factors worth attention instead.
+- Reply in the same language the user's question is written in.
+- Length: about 4 short paragraphs. No headers, no bullet lists, no card-by-card
+  labels — a flowing reading.`;
+
+// ===== AI INTERPRETATION (shared by /api/interpret and the Telegram bot) =====
 
 async function generateInterpretation(question, cards) {
   if (!GEMINI_API_KEY) {
     throw new Error('GEMINI_API_KEY is not configured on the server.');
   }
-
   if (typeof question !== 'string' || !question.trim() || question.trim().length > 400) {
     throw new Error('Invalid question.');
   }
-
   if (!Array.isArray(cards) || cards.length !== 3) {
     throw new Error('Exactly three cards are required.');
   }
-
   for (const c of cards) {
     if (
       typeof c?.position !== 'string' ||
@@ -99,12 +105,16 @@ async function generateInterpretation(question, cards) {
 
   const userMessage = `User's question:\n"${question.trim()}"\n\nDrawn spread:\n\n${cardBlock}`;
 
+  // Timeout guard so a stalled Gemini request can never hang the request forever
+  // (adopted from server_lust.js — this is what prevents "no response at all").
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 60000);
 
+  let response;
+  let raw;
   try {
-    const response = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
+    response = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent',
       {
         method: 'POST',
         headers: {
@@ -112,53 +122,14 @@ async function generateInterpretation(question, cards) {
           'x-goog-api-key': GEMINI_API_KEY
         },
         body: JSON.stringify({
-          systemInstruction: {
-            parts: [{ text: SYSTEM_PROMPT }]
-          },
-          contents: [
-            {
-              role: 'user',
-              parts: [{ text: userMessage }]
-            }
-          ],
-          generationConfig: {
-            maxOutputTokens: 3000
-          }
+          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+          contents: [{ role: 'user', parts: [{ text: userMessage }] }],
+          generationConfig: { maxOutputTokens: 3000 }
         }),
         signal: controller.signal
       }
     );
-
-    const raw = await response.text();
-    let responseData;
-
-    try {
-      responseData = JSON.parse(raw);
-    } catch {
-      throw new Error(`Gemini returned invalid JSON (HTTP ${response.status}).`);
-    }
-
-    if (!response.ok) {
-      const message = responseData?.error?.message || `Gemini API HTTP ${response.status}`;
-      throw new Error(message);
-    }
-
-    const interpretation = responseData?.candidates?.[0]?.content?.parts
-      ?.filter((part) => typeof part.text === 'string')
-      .map((part) => part.text)
-      .join('\n')
-      .trim();
-
-    if (!interpretation) {
-      const reason = responseData?.candidates?.[0]?.finishReason;
-      throw new Error(
-        reason
-          ? `Gemini returned no text (finishReason: ${reason}).`
-          : 'Gemini returned an empty interpretation.'
-      );
-    }
-
-    return interpretation;
+    raw = await response.text();
   } catch (err) {
     if (err?.name === 'AbortError') {
       throw new Error('Gemini request timed out after 60 seconds.');
@@ -167,28 +138,60 @@ async function generateInterpretation(question, cards) {
   } finally {
     clearTimeout(timeout);
   }
+
+  let responseData;
+  try {
+    responseData = JSON.parse(raw);
+  } catch {
+    throw new Error(`Gemini returned invalid JSON (HTTP ${response.status}).`);
+  }
+
+  if (!response.ok) {
+    console.error('[tarot-omen] Gemini API error:', responseData);
+    throw new Error(responseData?.error?.message || `Gemini API HTTP ${response.status}`);
+  }
+
+  const interpretation = responseData?.candidates?.[0]?.content?.parts
+    ?.filter((part) => typeof part.text === 'string')
+    .map((part) => part.text)
+    .join('\n')
+    .trim();
+
+  if (!interpretation) {
+    const reason = responseData?.candidates?.[0]?.finishReason;
+    throw new Error(
+      reason ? `Gemini returned no text (finishReason: ${reason}).` : 'Gemini returned an empty interpretation.'
+    );
+  }
+
+  return capText(interpretation, MAX_INTERPRETATION_CHARS);
 }
+
+// ===== /api/interpret — used by the Mini App frontend =====
 
 app.post('/api/interpret', async (req, res) => {
   try {
+    const clientKey = req.ip || 'unknown';
+    if (rateLimited(clientKey)) {
+      return res.status(429).json({ error: 'Too many readings requested. Please wait a few minutes.' });
+    }
+
     const body = req.body || {};
-    const question = typeof body.question === 'string'
-      ? body.question.trim()
-      : String(body.question || '').trim();
+    const question = typeof body.question === 'string' ? body.question.trim() : String(body.question || '').trim();
     const cards = body.cards;
 
     const interpretation = await generateInterpretation(question, cards);
     res.json({ interpretation });
   } catch (err) {
     console.error('[tarot-omen] /api/interpret failed:', err);
-    res.status(502).json({
-      error: err?.message || 'Something went wrong generating the reading.'
-    });
+    const status = /invalid|required|malformed/i.test(err?.message || '') ? 400 : 502;
+    res.status(status).json({ error: err?.message || 'Something went wrong generating the reading.' });
   }
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
-// ===== TAROT DECK FOR TELEGRAM =====
+
+// ===== TAROT DECK =====
 
 const MAJOR_ARCANA = [
   ["Шут", "новое начало, свобода, риск"],
@@ -252,11 +255,7 @@ const TAROT_DECK = [
 function drawThreeCards() {
   const shuffled = [...TAROT_DECK].sort(() => Math.random() - 0.5);
 
-  const positions = [
-    "Ситуация",
-    "Что влияет на ситуацию",
-    "К чему это может привести"
-  ];
+  const positions = ["Ситуация", "Что влияет на ситуацию", "К чему это может привести"];
 
   return shuffled.slice(0, 3).map((card, index) => ({
     position: positions[index],
@@ -265,178 +264,118 @@ function drawThreeCards() {
     keywords: card.keywords
   }));
 }
-// ===== TELEGRAM BOT =====
 
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+// ===== TELEGRAM BOT (webhook mode — no polling, no getUpdates loop) =====
+//
+// Render restarts/redeploys can briefly run two instances of the process.
+// Long-polling (getUpdates) breaks in that situation with a 409 Conflict,
+// because Telegram only allows one active getUpdates consumer per bot.
+// A webhook has no such problem: Telegram just POSTs each update to this
+// URL, and only whichever instance is currently live receives it.
+
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
+const TELEGRAM_MESSAGE_LIMIT = 4096;
+const TELEGRAM_CHUNK_SIZE = 3500; // safety margin under the 4096 hard limit
+
+function splitForTelegram(text, maxLen = TELEGRAM_CHUNK_SIZE) {
+  if (text.length <= maxLen) return [text];
+
+  const chunks = [];
+  let start = 0;
+  while (start < text.length) {
+    let end = Math.min(start + maxLen, text.length);
+    if (end < text.length) {
+      const window = text.slice(start, end);
+      const breakAt = Math.max(window.lastIndexOf('\n\n'), window.lastIndexOf('\n'), window.lastIndexOf(' '));
+      if (breakAt > maxLen * 0.5) {
+        end = start + breakAt;
+      }
+    }
+    const chunk = text.slice(start, end).trim();
+    if (chunk) chunks.push(chunk);
+    start = end;
+  }
+  return chunks;
+}
 
 async function telegramSendMessage(chatId, text) {
-  const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text: text
-    })
-  });
-
-  if (!response.ok) {
-    throw new Error(`Telegram sendMessage failed: ${await response.text()}`);
+  const parts = splitForTelegram(text);
+  for (const part of parts) {
+    const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: part })
+    });
+    if (!response.ok) {
+      const errBody = await response.text();
+      throw new Error(`Telegram sendMessage failed: ${errBody}`);
+    }
   }
 }
 
-async function telegramSendShuffleGif(chatId) {
-  // Optional animation. If shuffle.gif is not present, simply continue without it.
+async function handleTelegramUpdate(update) {
+  const message = update?.message;
+  if (!message || !message.text) return;
+
+  const chatId = message.chat.id;
+  const text = String(message.text || '').trim();
+
+  if (text === '/start') {
+    await telegramSendMessage(chatId, 'Привет! Напиши свой вопрос для расклада.');
+    return;
+  }
+
+  if (rateLimited(`tg:${chatId}`)) {
+    await telegramSendMessage(chatId, 'Слишком много запросов подряд. Попробуй через пару минут.');
+    return;
+  }
+
   try {
-    const gifPath = new URL('./shuffle.gif', import.meta.url);
-    const gif = await readFile(gifPath);
+    const cards = drawThreeCards();
+    // Call the shared interpretation function directly instead of looping the
+    // request back through HTTP to our own /api/interpret endpoint — one fewer
+    // network hop and one fewer thing that can fail on Render.
+    const answer = await generateInterpretation(text, cards);
+    await telegramSendMessage(chatId, `🔮 Интерпретация\n\n${answer}`);
+  } catch (err) {
+    console.error('Telegram interpretation error:', err);
+    try {
+      await telegramSendMessage(chatId, 'Не удалось получить интерпретацию. Попробуй ещё раз.');
+    } catch (sendErr) {
+      console.error('Telegram: failed to even send the error message:', sendErr);
+    }
+  }
+}
 
-    const form = new FormData();
-    form.append('chat_id', String(chatId));
-    form.append('animation', new Blob([gif], { type: 'image/gif' }), 'shuffle.gif');
-    form.append('caption', '🔮 Перемешиваю карты...');
+app.post('/telegram-webhook', (req, res) => {
+  // Acknowledge immediately so Telegram doesn't time out and retry the same
+  // update while we're still waiting on Gemini.
+  res.sendStatus(200);
+  handleTelegramUpdate(req.body).catch((err) => {
+    console.error('Telegram webhook handler error:', err);
+  });
+});
 
-    const response = await fetch(
-      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendAnimation`,
-      { method: 'POST', body: form }
-    );
-
-    if (!response.ok) {
-      console.warn('[tarot-omen] shuffle.gif was not sent:', await response.text());
+async function setupTelegramWebhook() {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  try {
+    const response = await fetch(`${TELEGRAM_API}/setWebhook`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: TELEGRAM_WEBHOOK_URL, drop_pending_updates: true })
+    });
+    const data = await response.json();
+    if (!data.ok) {
+      console.error('[tarot-omen] setWebhook failed:', data);
+    } else {
+      console.log('[tarot-omen] Telegram webhook set to', TELEGRAM_WEBHOOK_URL);
     }
   } catch (err) {
-    console.warn('[tarot-omen] shuffle animation skipped:', err?.message || err);
+    console.error('[tarot-omen] setWebhook error:', err);
   }
 }
 
-async function telegramSendCards(chatId, cards) {
-  // Do not ask Telegram to download external image URLs.
-  // That caused WEBPAGE_CURL_FAILED on Telegram's side.
-  // Reveal the exact cards as a compact text message instead.
-  const lines = cards.map((card, index) => {
-    const orientation = card.orientation === 'reversed' ? 'перевёрнутая' : 'прямая';
-    return `${index + 1}. ${card.name} — ${orientation}\n${card.position}`;
-  });
-
-  await telegramSendMessage(chatId, `🔮 Выпали карты:\n\n${lines.join('\n\n')}`);
-}
-
-async function telegramSendLongMessage(chatId, text) {
-  const MAX_LENGTH = 3900;
-
-  if (typeof text !== 'string' || !text.length) {
-    return;
-  }
-
-  let remaining = text.trim();
-
-  while (remaining.length > MAX_LENGTH) {
-    let cut = remaining.lastIndexOf('\n\n', MAX_LENGTH);
-    if (cut < 1000) cut = remaining.lastIndexOf('\n', MAX_LENGTH);
-    if (cut < 1000) cut = remaining.lastIndexOf(' ', MAX_LENGTH);
-    if (cut < 1) cut = MAX_LENGTH;
-
-    const part = remaining.slice(0, cut).trim();
-    remaining = remaining.slice(cut).trim();
-
-    await telegramSendMessage(chatId, part);
-  }
-
-  if (remaining) {
-    await telegramSendMessage(chatId, remaining);
-  }
-}
-
-async function telegramGetUpdates(offset = 0) {
-  const response = await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?timeout=30&offset=${offset}`
-  );
-
-  const data = await response.json();
-
-  if (!response.ok || !data.ok) {
-    if (data.error_code === 409) {
-      throw new Error(
-        "Telegram 409 Conflict: another bot instance is already polling getUpdates."
-      );
-    }
-
-    throw new Error(data.description || "Telegram getUpdates failed");
-  }
-
-  return data;
-}
-
-async function runTelegramBot() {
-  if (!TELEGRAM_BOT_TOKEN) {
-    console.error("TELEGRAM_BOT_TOKEN is not set");
-    return;
-  }
-
-  let offset = 0;
-
-  console.log("Telegram bot starting...");
-
-  while (true) {
-    try {
-      const data = await telegramGetUpdates(offset);
-
-      if (!data.ok) {
-        console.error("Telegram error:", data);
-        await new Promise(r => setTimeout(r, 5000));
-        continue;
-      }
-
-      for (const update of data.result) {
-        offset = update.update_id + 1;
-
-        const message = update.message;
-
-        if (!message || !message.text) continue;
-
-        const chatId = message.chat.id;
-        const text = String(message.text || "").trim();
-
-        if (text === "/start") {
-          await telegramSendMessage(
-            chatId,
-            "Привет! Напиши свой вопрос для расклада."
-          );
-          continue;
-        }
-
-        try {
-          const cards = drawThreeCards();
-
-          // Generate the interpretation directly.
-          const answer = await generateInterpretation(text, cards);
-
-          // Reveal the exact three cards that Gemini interpreted.
-          await telegramSendCards(chatId, cards);
-
-          // Telegram has a 4096-character limit per message, so long readings
-          // are split into several safe messages.
-          await telegramSendLongMessage(chatId, `🔮 Интерпретация\n\n${answer}`);
-
-        } catch (err) {
-          console.error("Telegram interpretation error:", err);
-
-          await telegramSendMessage(
-            chatId,
-            `Не удалось получить интерпретацию.\n\nОшибка: ${err?.message || "неизвестная ошибка"}`
-          );
-        }
-      }
-
-    } catch (err) {
-      console.error("Telegram polling error:", err);
-      await new Promise(r => setTimeout(r, 5000));
-    }
-  }
-}
-
-runTelegramBot();
 app.listen(PORT, () => {
   console.log(`[tarot-omen] backend listening on port ${PORT}`);
+  setupTelegramWebhook();
 });
