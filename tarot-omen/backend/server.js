@@ -274,22 +274,6 @@ function drawThreeCards() {
     keywords: card.keywords
   }));
 }
-function drawThreeCards() {
-  const shuffled = [...TAROT_DECK].sort(() => Math.random() - 0.5);
-
-  const positions = [
-    "Ситуация",
-    "Что влияет на ситуацию",
-    "К чему это может привести"
-  ];
-
-  return shuffled.slice(0, 3).map((card, index) => ({
-    position: positions[index],
-    name: card.name,
-    orientation: Math.random() < 0.5 ? "upright" : "reversed",
-    keywords: card.keywords
-  }));
-}
 
 async function telegramSendMessage(chatId, text) {
   const response = await fetch(
