@@ -1,7 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import { readFile } from 'node:fs/promises';
 
 const PORT = process.env.PORT || 8787;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -31,159 +30,125 @@ function rateLimited(key) {
   return arr.length > MAX_HITS;
 }
 
-const SYSTEM_PROMPT = `You are the reading voice of Tarot Omen, a thoughtful and immersive Tarot reader.
+const SYSTEM_PROMPT = `You are the reading voice of Tarot Omen, a Tarot mini app.
 
-You receive: a user's question and three ALREADY-DRAWN Tarot cards. Each card has a
-position, name, orientation (upright or reversed), and keywords. The cards were
-chosen randomly before you were called. YOU NEVER CHOOSE, REPLACE, OR INVENT CARDS.
+You receive: a user's question, and three already-drawn Tarot cards (each with its
+position, name, and orientation — upright or reversed). The cards were chosen by a
+random generator before you were called. You never choose or invent cards.
 
-Your task is to give a DEEP, PERSONAL reading of this exact spread in relation to
-the exact question. Do not give a generic encyclopedia-style description of Tarot.
-
-Reading rules:
-- Interpret each card through its exact position and orientation.
-- Explain what each card contributes to the situation, but weave the cards into
-  one connected story rather than writing three disconnected definitions.
-- Pay close attention to the wording and emotional meaning of the user's actual
-  question.
-- Explain tensions, repetitions, contrasts, and progression between the three cards.
-- Distinguish what seems to be the underlying situation, what is influencing it,
-  and what direction the spread points toward.
-- End with a practical, grounded takeaway: what the person can reflect on, notice,
-  or do next. Do not give absolute predictions.
-- Use reflective language such as "the cards suggest", "the spread points to",
-  "this can indicate". Never claim supernatural certainty.
-- If the question concerns health: never diagnose and never claim the person is or
-  is not healthy. Keep it reflective and gently recommend a qualified professional
-  when appropriate.
-- If the question concerns money or finance: never promise a financial result.
-  Discuss patterns, choices, risks and factors worth attention.
-- Reply in the same language as the user's question.
-- Make the reading substantial: 7–10 well-developed paragraphs, approximately
-  800–1100 words when the language allows it. Do not rush to the conclusion.
-- You may use short section labels such as "Общий смысл расклада", the card
-  positions, "Связь карт" and "Что взять из расклада", but do not use bullet lists.
-- Do not mention that you are an AI, an API, a prompt, a model, or that the cards
-  were supplied by software.`;
-
-async function generateInterpretation(question, cards) {
-  if (!GEMINI_API_KEY) {
-    throw new Error('GEMINI_API_KEY is not configured on the server.');
-  }
-
-  if (typeof question !== 'string' || !question.trim() || question.trim().length > 400) {
-    throw new Error('Invalid question.');
-  }
-
-  if (!Array.isArray(cards) || cards.length !== 3) {
-    throw new Error('Exactly three cards are required.');
-  }
-
-  for (const c of cards) {
-    if (
-      typeof c?.position !== 'string' ||
-      typeof c?.name !== 'string' ||
-      (c.orientation !== 'upright' && c.orientation !== 'reversed') ||
-      typeof c?.keywords !== 'string'
-    ) {
-      throw new Error('Malformed card data.');
-    }
-  }
-
-  const cardBlock = cards
-    .map(
-      (c, i) =>
-        `Card ${i + 1} — ${c.position}\nName: ${c.name}\nOrientation: ${c.orientation}\nKeywords: ${c.keywords}`
-    )
-    .join('\n\n');
-
-  const userMessage = `User's question:\n"${question.trim()}"\n\nDrawn spread:\n\n${cardBlock}`;
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60000);
-
-  try {
-    const response = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': GEMINI_API_KEY
-        },
-        body: JSON.stringify({
-          systemInstruction: {
-            parts: [{ text: SYSTEM_PROMPT }]
-          },
-          contents: [
-            {
-              role: 'user',
-              parts: [{ text: userMessage }]
-            }
-          ],
-          generationConfig: {
-            maxOutputTokens: 3000
-          }
-        }),
-        signal: controller.signal
-      }
-    );
-
-    const raw = await response.text();
-    let responseData;
-
-    try {
-      responseData = JSON.parse(raw);
-    } catch {
-      throw new Error(`Gemini returned invalid JSON (HTTP ${response.status}).`);
-    }
-
-    if (!response.ok) {
-      const message = responseData?.error?.message || `Gemini API HTTP ${response.status}`;
-      throw new Error(message);
-    }
-
-    const interpretation = responseData?.candidates?.[0]?.content?.parts
-      ?.filter((part) => typeof part.text === 'string')
-      .map((part) => part.text)
-      .join('\n')
-      .trim();
-
-    if (!interpretation) {
-      const reason = responseData?.candidates?.[0]?.finishReason;
-      throw new Error(
-        reason
-          ? `Gemini returned no text (finishReason: ${reason}).`
-          : 'Gemini returned an empty interpretation.'
-      );
-    }
-
-    return interpretation;
-  } catch (err) {
-    if (err?.name === 'AbortError') {
-      throw new Error('Gemini request timed out after 60 seconds.');
-    }
-    throw err;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
+Write one unified, personal interpretation of the spread AS IT RELATES TO THE
+QUESTION — not a generic listing of card meanings. Specifically:
+- Read each card in light of its position (The Situation / What Influences It /
+  Where It May Lead) and its orientation.
+- Weave the three cards into one coherent narrative, noting how they interact.
+- Be specific to the question's actual topic and phrasing.
+- Keep language reflective and open, e.g. "The cards suggest...", "This spread
+  points to...", "Seen through this reading...". Never claim certainty about the
+  future (avoid phrasing like "this will definitely happen").
+- If the question concerns health: never diagnose, and never state that the
+  person is or is not healthy. Offer only reflective interpretation, and if
+  symptoms sound potentially serious, gently recommend seeing a qualified
+  professional.
+- If the question concerns money or finance: never promise a financial outcome
+  (e.g. never say "you will definitely make money"). Offer reflective
+  interpretation of the situation and factors worth attention instead.
+- Reply in the same language the user's question is written in.
+- Length: about 4 short paragraphs. No headers, no bullet lists, no card-by-card
+  labels — a flowing reading.`;
 
 app.post('/api/interpret', async (req, res) => {
   try {
-    const body = req.body || {};
-    const question = typeof body.question === 'string'
-      ? body.question.trim()
-      : String(body.question || '').trim();
-    const cards = body.cards;
 
-    const interpretation = await generateInterpretation(question, cards);
+    const body = req.body || {};
+const question = typeof body.question === 'string'
+  ? body.question.trim()
+  : String(body.question || '').trim();
+
+const cards = body.cards;
+
+if (!question || question.length > 400) {
+  return res.status(400).json({ error: 'Invalid question.' });
+}
+    if (!Array.isArray(cards) || cards.length !== 3) {
+      return res.status(400).json({ error: 'Exactly three cards are required.' });
+    }
+    for (const c of cards) {
+      if (
+        typeof c?.position !== 'string' ||
+        typeof c?.name !== 'string' ||
+        (c.orientation !== 'upright' && c.orientation !== 'reversed') ||
+        typeof c?.keywords !== 'string'
+      ) {
+        return res.status(400).json({ error: 'Malformed card data.' });
+      }
+    }
+
+    const cardBlock = cards
+      .map(
+        (c, i) =>
+          `Card ${i + 1} — ${c.position}\nName: ${c.name}\nOrientation: ${c.orientation}\nKeywords: ${c.keywords}`
+      )
+      .join('\n\n');
+
+    const userMessage = `User's question:\n"${question.trim()}"\n\nDrawn spread:\n\n${cardBlock}`;
+
+    const response = await fetch(
+  'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent',
+  {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-goog-api-key': GEMINI_API_KEY
+    },
+    body: JSON.stringify({
+      systemInstruction: {
+        parts: [
+          {
+            text: SYSTEM_PROMPT
+          }
+        ]
+      },
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: userMessage
+            }
+          ]
+        }
+      ],
+      generationConfig: {
+        maxOutputTokens: 700
+      }
+    })
+  }
+);
+
+const responseData = await response.json();
+
+if (!response.ok) {
+  console.error('[tarot-omen] Gemini API error:', responseData);
+
+  return res.status(502).json({
+    error: responseData?.error?.message || 'Gemini API request failed.'
+  });
+}
+
+const interpretation = responseData?.candidates?.[0]?.content?.parts
+  ?.filter((part) => typeof part.text === 'string')
+  .map((part) => part.text)
+  .join('\n')
+  .trim();
+
+    if (!interpretation) {
+      return res.status(502).json({ error: 'The reading came back empty. Please try again.' });
+    }
+
     res.json({ interpretation });
   } catch (err) {
     console.error('[tarot-omen] /api/interpret failed:', err);
-    res.status(502).json({
-      error: err?.message || 'Something went wrong generating the reading.'
-    });
+    res.status(500).json({ error: 'Something went wrong generating the reading.' });
   }
 });
 
@@ -270,7 +235,7 @@ function drawThreeCards() {
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
 async function telegramSendMessage(chatId, text) {
-  const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+  await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
@@ -280,94 +245,6 @@ async function telegramSendMessage(chatId, text) {
       text: text
     })
   });
-
-  if (!response.ok) {
-    throw new Error(`Telegram sendMessage failed: ${await response.text()}`);
-  }
-}
-
-async function telegramSendShuffleGif(chatId) {
-  const gifPath = new URL('./shuffle.gif', import.meta.url);
-  const gif = await readFile(gifPath);
-
-  const form = new FormData();
-  form.append('chat_id', String(chatId));
-  form.append('animation', new Blob([gif], { type: 'image/gif' }), 'shuffle.gif');
-  form.append('caption', '🔮 Перемешиваю карты...');
-
-  const response = await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendAnimation`,
-    { method: 'POST', body: form }
-  );
-
-  if (!response.ok) {
-    throw new Error(`Telegram sendAnimation failed: ${await response.text()}`);
-  }
-
-  return (await response.json()).result;
-}
-
-function tarotImageCode(name) {
-  const major = {
-    "Шут":"ar00","Маг":"ar01","Верховная Жрица":"ar02","Императрица":"ar03",
-    "Император":"ar04","Иерофант":"ar05","Влюблённые":"ar06","Колесница":"ar07",
-    "Сила":"ar08","Отшельник":"ar09","Колесо Фортуны":"ar10","Справедливость":"ar11",
-    "Повешенный":"ar12","Смерть":"ar13","Умеренность":"ar14","Дьявол":"ar15",
-    "Башня":"ar16","Звезда":"ar17","Луна":"ar18","Солнце":"ar19","Суд":"ar20","Мир":"ar21"
-  };
-
-  if (major[name]) return major[name];
-
-  const suitMap = {
-    "Жезлов":"wa", "Кубков":"cu", "Мечей":"sw", "Пентаклей":"pe"
-  };
-  const rankMap = {
-    "Туз":"ac", "Паж":"pa", "Рыцарь":"kn", "Королева":"qu", "Король":"ki",
-    "Двойка":"02", "Тройка":"03", "Четвёрка":"04", "Пятёрка":"05",
-    "Шестёрка":"06", "Семёрка":"07", "Восьмёрка":"08", "Девятка":"09", "Десятка":"10"
-  };
-
-  for (const [rank, rankCode] of Object.entries(rankMap)) {
-    for (const [suit, suitCode] of Object.entries(suitMap)) {
-      if (name === `${rank} ${suit}`) return `${suitCode}${rankCode}`;
-    }
-  }
-
-  return null;
-}
-
-async function telegramSendCards(chatId, cards) {
-  const media = cards.map((card, index) => {
-    const code = tarotImageCode(card.name);
-    const imageUrl = code
-      ? `https://petaloverflow.github.io/tarot-api/cards/${code}.jpg`
-      : null;
-
-    if (!imageUrl) {
-      throw new Error(`No image mapping for Tarot card: ${card.name}`);
-    }
-
-    const orientation = card.orientation === 'reversed' ? 'перевёрнутая' : 'прямая';
-
-    return {
-      type: 'photo',
-      media: imageUrl,
-      caption: `${index + 1}. ${card.name}\n${orientation}\n${card.position}`
-    };
-  });
-
-  const response = await fetch(
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMediaGroup`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, media })
-    }
-  );
-
-  if (!response.ok) {
-    throw new Error(`Telegram sendMediaGroup failed: ${await response.text()}`);
-  }
 }
 
 async function telegramGetUpdates(offset = 0) {
@@ -429,26 +306,40 @@ async function runTelegramBot() {
         }
 
         try {
-          const cards = drawThreeCards();
+          const interpretation = await fetch(
+            `http://127.0.0.1:${PORT}/api/interpret`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({
+  question: text,
+  cards: drawThreeCards()
+})
+            }
+          );
 
-          // Keep the animation on screen while Gemini is generating the reading.
+          const result = await interpretation.json();
 
-          // Generate the interpretation directly. This avoids an unnecessary
-          // Telegram -> HTTP -> Express -> Gemini round trip.
-          const answer = await generateInterpretation(text, cards);
+          if (!interpretation.ok) {
+            throw new Error(result.error || "Interpretation failed");
+          }
 
-          // Reveal the exact three cards that Gemini interpreted.
-          await telegramSendCards(chatId, cards);
+          const answer =
+            result.interpretation ||
+            result.text ||
+            result.answer ||
+            JSON.stringify(result);
 
-          // Then place the interpretation immediately after the cards.
-          await telegramSendMessage(chatId, `🔮 Интерпретация\n\n${answer}`);
+          await telegramSendMessage(chatId, answer);
 
         } catch (err) {
           console.error("Telegram interpretation error:", err);
 
           await telegramSendMessage(
             chatId,
-            `Не удалось получить интерпретацию.\n\nОшибка: ${err?.message || "неизвестная ошибка"}`
+            "Не удалось получить интерпретацию. Попробуй ещё раз."
           );
         }
       }
