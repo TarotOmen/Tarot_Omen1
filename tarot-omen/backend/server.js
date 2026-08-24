@@ -1,7 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
-import Anthropic from '@anthropic-ai/sdk';
 
 const PORT = process.env.PORT || 8787;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
