@@ -66,99 +66,124 @@ Reading rules:
 - Do not mention that you are an AI, an API, a prompt, a model, or that the cards
   were supplied by software.`;
 
-app.post('/api/interpret', async (req, res) => {
-  try {
-
-    const body = req.body || {};
-const question = typeof body.question === 'string'
-  ? body.question.trim()
-  : String(body.question || '').trim();
-
-const cards = body.cards;
-
-if (!question || question.length > 400) {
-  return res.status(400).json({ error: 'Invalid question.' });
-}
-    if (!Array.isArray(cards) || cards.length !== 3) {
-      return res.status(400).json({ error: 'Exactly three cards are required.' });
-    }
-    for (const c of cards) {
-      if (
-        typeof c?.position !== 'string' ||
-        typeof c?.name !== 'string' ||
-        (c.orientation !== 'upright' && c.orientation !== 'reversed') ||
-        typeof c?.keywords !== 'string'
-      ) {
-        return res.status(400).json({ error: 'Malformed card data.' });
-      }
-    }
-
-    const cardBlock = cards
-      .map(
-        (c, i) =>
-          `Card ${i + 1} — ${c.position}\nName: ${c.name}\nOrientation: ${c.orientation}\nKeywords: ${c.keywords}`
-      )
-      .join('\n\n');
-
-    const userMessage = `User's question:\n"${question.trim()}"\n\nDrawn spread:\n\n${cardBlock}`;
-
-    const response = await fetch(
-  'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
-  {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-goog-api-key': GEMINI_API_KEY
-    },
-    body: JSON.stringify({
-      systemInstruction: {
-        parts: [
-          {
-            text: SYSTEM_PROMPT
-          }
-        ]
-      },
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              text: userMessage
-            }
-          ]
-        }
-      ],
-      generationConfig: {
-        maxOutputTokens: 3000
-      }
-    })
+async function generateInterpretation(question, cards) {
+  if (!GEMINI_API_KEY) {
+    throw new Error('GEMINI_API_KEY is not configured on the server.');
   }
-);
 
-const responseData = await response.json();
+  if (typeof question !== 'string' || !question.trim() || question.trim().length > 400) {
+    throw new Error('Invalid question.');
+  }
 
-if (!response.ok) {
-  console.error('[tarot-omen] Gemini API error:', responseData);
+  if (!Array.isArray(cards) || cards.length !== 3) {
+    throw new Error('Exactly three cards are required.');
+  }
 
-  return res.status(502).json({
-    error: responseData?.error?.message || 'Gemini API request failed.'
-  });
-}
+  for (const c of cards) {
+    if (
+      typeof c?.position !== 'string' ||
+      typeof c?.name !== 'string' ||
+      (c.orientation !== 'upright' && c.orientation !== 'reversed') ||
+      typeof c?.keywords !== 'string'
+    ) {
+      throw new Error('Malformed card data.');
+    }
+  }
 
-const interpretation = responseData?.candidates?.[0]?.content?.parts
-  ?.filter((part) => typeof part.text === 'string')
-  .map((part) => part.text)
-  .join('\n')
-  .trim();
+  const cardBlock = cards
+    .map(
+      (c, i) =>
+        `Card ${i + 1} — ${c.position}\nName: ${c.name}\nOrientation: ${c.orientation}\nKeywords: ${c.keywords}`
+    )
+    .join('\n\n');
+
+  const userMessage = `User's question:\n"${question.trim()}"\n\nDrawn spread:\n\n${cardBlock}`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
+
+  try {
+    const response = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': GEMINI_API_KEY
+        },
+        body: JSON.stringify({
+          systemInstruction: {
+            parts: [{ text: SYSTEM_PROMPT }]
+          },
+          contents: [
+            {
+              role: 'user',
+              parts: [{ text: userMessage }]
+            }
+          ],
+          generationConfig: {
+            maxOutputTokens: 3000
+          }
+        }),
+        signal: controller.signal
+      }
+    );
+
+    const raw = await response.text();
+    let responseData;
+
+    try {
+      responseData = JSON.parse(raw);
+    } catch {
+      throw new Error(`Gemini returned invalid JSON (HTTP ${response.status}).`);
+    }
+
+    if (!response.ok) {
+      const message = responseData?.error?.message || `Gemini API HTTP ${response.status}`;
+      throw new Error(message);
+    }
+
+    const interpretation = responseData?.candidates?.[0]?.content?.parts
+      ?.filter((part) => typeof part.text === 'string')
+      .map((part) => part.text)
+      .join('\n')
+      .trim();
 
     if (!interpretation) {
-      return res.status(502).json({ error: 'The reading came back empty. Please try again.' });
+      const reason = responseData?.candidates?.[0]?.finishReason;
+      throw new Error(
+        reason
+          ? `Gemini returned no text (finishReason: ${reason}).`
+          : 'Gemini returned an empty interpretation.'
+      );
     }
 
+    return interpretation;
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error('Gemini request timed out after 60 seconds.');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+app.post('/api/interpret', async (req, res) => {
+  try {
+    const body = req.body || {};
+    const question = typeof body.question === 'string'
+      ? body.question.trim()
+      : String(body.question || '').trim();
+    const cards = body.cards;
+
+    const interpretation = await generateInterpretation(question, cards);
     res.json({ interpretation });
   } catch (err) {
     console.error('[tarot-omen] /api/interpret failed:', err);
-    res.status(500).json({ error: 'Something went wrong generating the reading.' });
+    res.status(502).json({
+      error: err?.message || 'Something went wrong generating the reading.'
+    });
   }
 });
 
@@ -406,37 +431,12 @@ async function runTelegramBot() {
         try {
           const cards = drawThreeCards();
 
-          // Show the question immediately so the user has a visible starting point.
-          await telegramSendMessage(chatId, `🔮 Ваш вопрос:\n\n${text}`);
-
           // Keep the animation on screen while Gemini is generating the reading.
           await telegramSendShuffleGif(chatId);
 
-          const interpretation = await fetch(
-            `http://127.0.0.1:${PORT}/api/interpret`,
-            {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json"
-              },
-              body: JSON.stringify({
-                question: text,
-                cards
-              })
-            }
-          );
-
-          const result = await interpretation.json();
-
-          if (!interpretation.ok) {
-            throw new Error(result.error || "Interpretation failed");
-          }
-
-          const answer =
-            result.interpretation ||
-            result.text ||
-            result.answer ||
-            JSON.stringify(result);
+          // Generate the interpretation directly. This avoids an unnecessary
+          // Telegram -> HTTP -> Express -> Gemini round trip.
+          const answer = await generateInterpretation(text, cards);
 
           // Reveal the exact three cards that Gemini interpreted.
           await telegramSendCards(chatId, cards);
@@ -449,7 +449,7 @@ async function runTelegramBot() {
 
           await telegramSendMessage(
             chatId,
-            "Не удалось получить интерпретацию. Попробуй ещё раз."
+            `Не удалось получить интерпретацию.\n\nОшибка: ${err?.message || "неизвестная ошибка"}`
           );
         }
       }
