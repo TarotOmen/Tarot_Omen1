@@ -513,7 +513,9 @@ function splitForTelegram(text, maxLen = TELEGRAM_CHUNK_SIZE) {
   return chunks;
 }
 
-async function telegramSendMessage(chatId, text) {
+async function telegramSendMessage(chatId, text, returnMessageIds = false) {
+  const messageIds = [];
+
   for (const part of splitForTelegram(text)) {
     const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
       method: 'POST',
@@ -527,7 +529,16 @@ async function telegramSendMessage(chatId, text) {
     if (!response.ok) {
       throw new Error(`Telegram sendMessage failed: ${await response.text()}`);
     }
+
+    if (returnMessageIds) {
+      const data = await response.json();
+      if (data.ok && data.result?.message_id) {
+        messageIds.push(data.result.message_id);
+      }
+    }
   }
+
+  return returnMessageIds ? messageIds : undefined;
 }
 
 async function telegramSendOracle(chatId) {
@@ -610,7 +621,6 @@ async function telegramSendSpreadImage(chatId, imageBuffer) {
     new Blob([imageBuffer], { type: 'image/png' }),
     'tarot-spread.png'
   );
-  form.append('caption', CARDS_CAPTION);
 
   const response = await fetch(`${TELEGRAM_API}/sendPhoto`, {
     method: 'POST',
@@ -654,7 +664,11 @@ async function handleTelegramUpdate(update) {
     const cards = drawThreeCards();
 
     // User-facing "mixing" state.
-    await telegramSendMessage(chatId, 'Мешаю карты...');
+    const mixingMessageIds = await telegramSendMessage(
+      chatId,
+      'Мешаю карты...',
+      true
+    );
 
     // GIF stays visible while the image is being prepared and Gemini is thinking.
     const shuffleMessageId = await telegramSendShuffleGif(chatId);
@@ -668,17 +682,34 @@ async function handleTelegramUpdate(update) {
     // Cards appear as soon as the visual spread is ready; do not wait for Gemini.
     const spreadImage = await spreadImagePromise;
 
-    // The GIF disappears exactly when the actual cards are revealed.
+    // The mixing text and GIF disappear together when the actual cards are revealed.
     await telegramSendSpreadImage(chatId, spreadImage);
+
+    for (const messageId of mixingMessageIds || []) {
+      await telegramDeleteMessage(chatId, messageId);
+    }
     await telegramDeleteMessage(chatId, shuffleMessageId);
 
-    // Deliberate 2-second pause after the cards/caption appear.
+    // The explanatory text is a separate temporary message so it can disappear
+    // after the final interpretation while the spread image remains.
+    const readingHintMessageIds = await telegramSendMessage(
+      chatId,
+      CARDS_CAPTION,
+      true
+    );
+
+    // Deliberate 2-second pause after the cards and explanatory text appear.
     await sleep(2000);
 
     // If Gemini is still working, this waits only as long as necessary.
     const answer = await interpretationPromise;
 
     await telegramSendMessage(chatId, answer);
+
+    // Remove the temporary explanatory text after the prediction arrives.
+    for (const messageId of readingHintMessageIds || []) {
+      await telegramDeleteMessage(chatId, messageId);
+    }
   } catch (err) {
     console.error('[tarot-omen] Telegram reading error:', err);
 
