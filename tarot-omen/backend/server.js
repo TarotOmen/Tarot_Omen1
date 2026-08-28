@@ -110,23 +110,35 @@ async function generateInterpretation(question, cards) {
   let response;
   let raw;
   try {
-    response = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': GEMINI_API_KEY
-        },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-          contents: [{ role: 'user', parts: [{ text: userMessage }] }],
-          generationConfig: { maxOutputTokens: 3000 }
-        }),
-        signal: controller.signal
+    const geminiPayload = {
+      systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+      contents: [{ role: 'user', parts: [{ text: userMessage }] }],
+      generationConfig: { maxOutputTokens: 3000 }
+    };
+
+    const MAX_GEMINI_ATTEMPTS = 3;
+    for (let attempt = 1; attempt <= MAX_GEMINI_ATTEMPTS; attempt++) {
+      response = await fetch(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': GEMINI_API_KEY
+          },
+          body: JSON.stringify(geminiPayload),
+          signal: controller.signal
+        }
+      );
+
+      raw = await response.text();
+
+      if (response.ok || ![429, 500, 502, 503, 504].includes(response.status) || attempt === MAX_GEMINI_ATTEMPTS) {
+        break;
       }
-    );
-    raw = await response.text();
+
+      await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
+    }
   } catch (err) {
     if (err?.name === 'AbortError') {
       throw new Error('Gemini request timed out after 60 seconds.');
@@ -245,10 +257,26 @@ const TAROT_DECK = [
   )
 ];
 
+const TEST_MODE = true;
+
 function drawThreeCards() {
-  const shuffled = [...TAROT_DECK].sort(() => Math.random() - 0.5);
   const positions = ["Ситуация", "Что влияет на ситуацию", "К чему это может привести"];
 
+  if (TEST_MODE) {
+    const testNames = ["Влюблённые", "Маг", "Верховная Жрица"];
+    return testNames.map((name, index) => {
+      const card = TAROT_DECK.find((c) => c.name === name);
+      if (!card) throw new Error(`Test card not found in deck: ${name}`);
+      return {
+        position: positions[index],
+        name: card.name,
+        orientation: Math.random() < 0.5 ? "upright" : "reversed",
+        keywords: card.keywords
+      };
+    });
+  }
+
+  const shuffled = [...TAROT_DECK].sort(() => Math.random() - 0.5);
   return shuffled.slice(0, 3).map((card, index) => ({
     position: positions[index],
     name: card.name,
