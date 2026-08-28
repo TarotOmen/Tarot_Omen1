@@ -513,9 +513,7 @@ function splitForTelegram(text, maxLen = TELEGRAM_CHUNK_SIZE) {
   return chunks;
 }
 
-async function telegramSendMessage(chatId, text, returnMessageIds = false) {
-  const messageIds = [];
-
+async function telegramSendMessage(chatId, text) {
   for (const part of splitForTelegram(text)) {
     const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
       method: 'POST',
@@ -529,16 +527,7 @@ async function telegramSendMessage(chatId, text, returnMessageIds = false) {
     if (!response.ok) {
       throw new Error(`Telegram sendMessage failed: ${await response.text()}`);
     }
-
-    if (returnMessageIds) {
-      const data = await response.json();
-      if (data.ok && data.result?.message_id) {
-        messageIds.push(data.result.message_id);
-      }
-    }
   }
-
-  return returnMessageIds ? messageIds : undefined;
 }
 
 async function telegramSendOracle(chatId) {
@@ -646,7 +635,7 @@ async function handleTelegramUpdate(update) {
 
     await telegramSendMessage(
       chatId,
-      'Я оракул Omen. Какой вопрос ты хочешь узнать, а может тебя что то беспокоит, расскажи и я разложу карты и вселенная даст тебе ответ.'
+      'Я оракул Omen. Какой вопрос ты хочешь узнать?\nРасскажи, я разложу карты и Вселенная даст тебе ответ.'
     );
 
     return;
@@ -665,11 +654,7 @@ async function handleTelegramUpdate(update) {
     const cards = drawThreeCards();
 
     // User-facing "mixing" state.
-    const mixingMessageIds = await telegramSendMessage(
-      chatId,
-      'Мешаю карты...',
-      true
-    );
+    await telegramSendMessage(chatId, 'Мешаю карты...');
 
     // GIF stays visible while the image is being prepared and Gemini is thinking.
     const shuffleMessageId = await telegramSendShuffleGif(chatId);
@@ -683,12 +668,8 @@ async function handleTelegramUpdate(update) {
     // Cards appear as soon as the visual spread is ready; do not wait for Gemini.
     const spreadImage = await spreadImagePromise;
 
-    // The mixing text and GIF disappear together when the actual cards are revealed.
+    // The GIF disappears exactly when the actual cards are revealed.
     await telegramSendSpreadImage(chatId, spreadImage);
-
-    for (const messageId of mixingMessageIds || []) {
-      await telegramDeleteMessage(chatId, messageId);
-    }
     await telegramDeleteMessage(chatId, shuffleMessageId);
 
     // Deliberate 2-second pause after the cards/caption appear.
