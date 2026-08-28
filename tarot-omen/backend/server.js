@@ -690,13 +690,8 @@ async function handleTelegramUpdate(update) {
     }
     await telegramDeleteMessage(chatId, shuffleMessageId);
 
-    // The explanatory text is a separate temporary message so it can disappear
-    // after the final interpretation while the spread image remains.
-    const readingHintMessageIds = await telegramSendMessage(
-      chatId,
-      CARDS_CAPTION,
-      true
-    );
+    // Persistent explanatory text under the spread.
+    await telegramSendMessage(chatId, CARDS_CAPTION);
 
     // Deliberate 2-second pause after the cards and explanatory text appear.
     await sleep(2000);
@@ -705,11 +700,6 @@ async function handleTelegramUpdate(update) {
     const answer = await interpretationPromise;
 
     await telegramSendMessage(chatId, answer);
-
-    // Remove the temporary explanatory text after the prediction arrives.
-    for (const messageId of readingHintMessageIds || []) {
-      await telegramDeleteMessage(chatId, messageId);
-    }
   } catch (err) {
     console.error('[tarot-omen] Telegram reading error:', err);
 
