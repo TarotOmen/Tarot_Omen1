@@ -286,9 +286,10 @@ function drawThreeCards() {
 }
 
 // Current GitHub layout: assets are directly inside backend/.
-const SHUFFLE_GIF_PATH = path.join(__dirname, 'shuffle.gif');
-const TABLE_PATH = path.join(__dirname, 'table.png');
-const CARDS_DIR = __dirname;
+const ASSETS_DIR = path.join(__dirname, 'assets');
+const SHUFFLE_GIF_PATH = path.join(ASSETS_DIR, 'shuffle.gif');
+const TABLE_PATH = path.join(ASSETS_DIR, 'table.png');
+const CARDS_DIR = path.join(__dirname, 'cards');
 
 function cardSlug(name) {
   const major = {
@@ -358,17 +359,19 @@ async function cardPathFor(card) {
 }
 
 const CARD_LAYOUT = [
-  { centerX: 275, centerY: 510, angle: 7, z: 1 },
+  { centerX: 275, centerY: 510, angle: -7, z: 1 },
   { centerX: 768, centerY: 500, angle: 0, z: 3 },
-  { centerX: 1260, centerY: 510, angle: -7, z: 2 }
+  { centerX: 1260, centerY: 510, angle: 7, z: 2 }
 ];
 
 async function makeCardLayer(card, layout) {
   const input = await readFile(await cardPathFor(card));
 
+  const totalAngle = card.orientation === 'reversed' ? 180 + layout.angle : layout.angle;
+
   const cardRotated = await sharp(input)
     .resize({ height: 760, fit: 'contain' })
-    .rotate(layout.angle, { background: { r: 0, g: 0, b: 0, alpha: 0 } })
+    .rotate(totalAngle, { background: { r: 0, g: 0, b: 0, alpha: 0 } })
     .png()
     .toBuffer();
 
@@ -476,6 +479,17 @@ async function telegramSendMessage(chatId, text) {
   }
 }
 
+async function getShuffleDurationMs(gifBuffer) {
+  try {
+    const meta = await sharp(gifBuffer, { animated: true }).metadata();
+    const delays = Array.isArray(meta.delay) ? meta.delay : [meta.delay || 0];
+    const total = delays.reduce((sum, delay) => sum + Number(delay || 0), 0);
+    return Math.max(total, 1500);
+  } catch {
+    return 3000;
+  }
+}
+
 async function telegramSendShuffleGif(chatId) {
   const gifBuffer = await readFile(SHUFFLE_GIF_PATH);
 
@@ -528,14 +542,20 @@ async function handleTelegramUpdate(update) {
   try {
     const cards = drawThreeCards();
 
+    const gifBuffer = await readFile(SHUFFLE_GIF_PATH);
+    const shuffleDurationPromise = getShuffleDurationMs(gifBuffer);
+
+    await telegramSendMessage(chatId, 'Мешаю карты…');
     await telegramSendShuffleGif(chatId);
 
     const interpretationPromise = generateInterpretation(text, cards);
     const spreadImagePromise = buildReadingImage(cards);
+    const shuffleDuration = await shuffleDurationPromise;
 
     const [answer, spreadImage] = await Promise.all([
       interpretationPromise,
-      spreadImagePromise
+      spreadImagePromise,
+      new Promise((resolve) => setTimeout(resolve, shuffleDuration))
     ]);
 
     await telegramSendSpreadImage(chatId, spreadImage);
