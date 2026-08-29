@@ -64,6 +64,7 @@ function rateLimited(key) {
 }
 
 const MAX_INTERPRETATION_CHARS = 3000;
+const MAX_VOICE_CHARS = 280;
 
 function capText(text, maxLen) {
   if (text.length <= maxLen) return text;
@@ -71,6 +72,14 @@ function capText(text, maxLen) {
   const lastBreak = Math.max(slice.lastIndexOf('\n'), slice.lastIndexOf('. '));
   const cut = lastBreak > maxLen * 0.6 ? lastBreak + 1 : maxLen;
   return text.slice(0, cut).trim() + '…';
+}
+
+function capVoiceText(text, maxLen = MAX_VOICE_CHARS) {
+  if (text.length <= maxLen) return text;
+  const slice = text.slice(0, maxLen);
+  const breaks = [slice.lastIndexOf('. '), slice.lastIndexOf('! '), slice.lastIndexOf('? '), slice.lastIndexOf('…')];
+  const cut = Math.max(...breaks);
+  return (cut > maxLen * 0.6 ? slice.slice(0, cut + 1) : slice).trim();
 }
 
 const SYSTEM_PROMPT = `You are the reading voice of Tarot Omen, a Tarot mini app.
@@ -102,7 +111,7 @@ Produce TWO versions of the SAME interpretation:
   voice message.
 - It must communicate the most important insight from the full interpretation,
   not introduce a different meaning.
-- 2 to 4 natural spoken sentences, roughly 180-450 characters when possible.
+- 2 to 4 natural spoken sentences, roughly 160-280 characters when possible.
 - Sound like Omen is personally speaking to one person, not reading an article.
 - Calm, intimate, confident and slightly mysterious, but natural.
 - Use natural pauses and conversational phrasing.
@@ -1187,11 +1196,11 @@ async function lavaCreateInvoice(chatId, session, kind, currency, paymentMethod 
     amount
   };
 
-  // Lava API: for RUB, PAY2ME supports explicit CARD or SBP payment methods.
-  // For USD we keep the existing provider/default behavior unchanged.
-  if (normalizedCurrency === 'RUB' && (paymentMethod === 'CARD' || paymentMethod === 'SBP')) {
+  // Russian card payments keep Lava's default RUB provider (SMART_GLOCAL).
+  // SBP is explicitly routed through PAY2ME using paymentMethod=SBP.
+  if (normalizedCurrency === 'RUB' && paymentMethod === 'SBP') {
     payload.paymentProvider = 'PAY2ME';
-    payload.paymentMethod = paymentMethod;
+    payload.paymentMethod = 'SBP';
   }
 
   const createInvoice = async (currentOfferId) => {
@@ -1284,7 +1293,7 @@ async function lavaCreateInvoice(chatId, session, kind, currency, paymentMethod 
     amount,
     offerId,
     paymentMethod: normalizedCurrency === 'RUB' ? (paymentMethod || 'CARD') : '',
-    paymentProvider: normalizedCurrency === 'RUB' ? 'PAY2ME' : '',
+    paymentProvider: paymentMethod === 'SBP' ? 'PAY2ME' : '',
     email,
     createdAt: Date.now()
   };
@@ -1525,7 +1534,7 @@ async function runPaidThreeCardReading(chatId, session, question) {
 
     // Paid readings include the voice. The user never pays separately for the voice.
     try {
-      const voiceBuffer = await elevenLabsTextToSpeech(result.voiceInterpretation);
+      const voiceBuffer = await elevenLabsTextToSpeech(capVoiceText(result.voiceInterpretation));
       if (voiceBuffer) await telegramSendVoice(chatId, voiceBuffer);
     } catch (voiceErr) {
       console.error('[tarot-omen] Paid reading voice generation failed; continuing with text:', voiceErr);
@@ -1595,7 +1604,7 @@ async function handleTelegramUpdate(update) {
       } else if (callback.data === 'pay:lava:reading:RUB:SBP') {
         await createPaymentInvoice(chatId, session, 'reading', 'RUB', 'SBP');
       } else if (callback.data === 'pay:lava:reading:RUB') {
-        // Backward compatibility for an old button already present in a chat.
+        // Backward compatibility for an older combined RUB button.
         await createPaymentInvoice(chatId, session, 'reading', 'RUB', 'CARD');
       } else if (callback.data === 'pay:lava:reading:USD') {
         await createPaymentInvoice(chatId, session, 'reading', 'USD');
@@ -1903,7 +1912,7 @@ async function handleTelegramUpdate(update) {
     const includeVoice = !session?.freeReadingUsed;
     if (includeVoice) {
       try {
-        const voiceBuffer = await elevenLabsTextToSpeech(result.voiceInterpretation);
+        const voiceBuffer = await elevenLabsTextToSpeech(capVoiceText(result.voiceInterpretation));
         if (voiceBuffer) await telegramSendVoice(chatId, voiceBuffer);
       } catch (voiceErr) {
         console.error('[tarot-omen] Reading voice generation failed; continuing with text:', voiceErr);
