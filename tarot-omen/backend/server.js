@@ -261,62 +261,142 @@ async function generateConversationResponse({ userName, originalQuestion, cards,
 
   const userMessage = `Telegram first name: ${userName || '(not available)'}\n\nOriginal question:\n"${originalQuestion}"\n\nCards from the completed reading:\n${cardBlock}\n\nOriginal interpretation:\n${interpretation}\n\nConversation so far:\n${historyBlock}\n\nLatest user message:\n"${latestMessage}"`;
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60000);
+  // Gemini can occasionally return a transient empty/malformed response even
+  // when the request itself is valid. Retry once before showing an error to the
+  // user. This also prevents a single transient API hiccup from looking like a
+  // broken Omen conversation.
+  let lastError;
 
-  let response;
-  let raw;
-  try {
-    response = await fetch(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': GEMINI_API_KEY
-        },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: CONVERSATION_SYSTEM_PROMPT }] },
-          contents: [{ role: 'user', parts: [{ text: userMessage }] }],
-          generationConfig: {
-            maxOutputTokens: 1200,
-            responseMimeType: 'application/json'
-          }
-        }),
-        signal: controller.signal
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60000);
+
+    let response;
+    let raw;
+
+    try {
+      response = await fetch(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': GEMINI_API_KEY
+          },
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: CONVERSATION_SYSTEM_PROMPT }] },
+            contents: [{ role: 'user', parts: [{ text: userMessage }] }],
+            generationConfig: {
+              maxOutputTokens: 1200,
+              responseMimeType: 'application/json'
+            }
+          }),
+          signal: controller.signal
+        }
+      );
+      raw = await response.text();
+    } catch (err) {
+      if (err?.name === 'AbortError') {
+        lastError = new Error('Gemini conversation request timed out after 60 seconds.');
+      } else {
+        lastError = err;
       }
-    );
-    raw = await response.text();
-  } catch (err) {
-    if (err?.name === 'AbortError') throw new Error('Gemini conversation request timed out after 60 seconds.');
-    throw err;
-  } finally {
-    clearTimeout(timeout);
+
+      console.error(`[tarot-omen] Conversation Gemini attempt ${attempt} failed:`, lastError);
+      if (attempt < 2) {
+        await sleep(500);
+        continue;
+      }
+      throw lastError;
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      lastError = new Error(`Gemini returned invalid JSON (HTTP ${response.status}).`);
+      console.error(`[tarot-omen] Conversation Gemini attempt ${attempt}:`, lastError, raw?.slice(0, 500));
+      if (attempt < 2) {
+        await sleep(500);
+        continue;
+      }
+      throw lastError;
+    }
+
+    if (!response.ok) {
+      lastError = new Error(data?.error?.message || `Gemini API HTTP ${response.status}`);
+      console.error(`[tarot-omen] Conversation Gemini attempt ${attempt}:`, lastError);
+      if (attempt < 2 && response.status >= 500) {
+        await sleep(500);
+        continue;
+      }
+      throw lastError;
+    }
+
+    const generated = data?.candidates?.[0]?.content?.parts
+      ?.filter((part) => typeof part.text === 'string')
+      .map((part) => part.text)
+      .join('')
+      .trim();
+
+    if (!generated) {
+      lastError = new Error('Gemini returned an empty conversation response.');
+      console.error(`[tarot-omen] Conversation Gemini attempt ${attempt}:`, lastError, {
+        finishReason: data?.candidates?.[0]?.finishReason,
+        promptFeedback: data?.promptFeedback
+      });
+      if (attempt < 2) {
+        await sleep(500);
+        continue;
+      }
+      throw lastError;
+    }
+
+    let result;
+    try {
+      result = JSON.parse(generated);
+    } catch {
+      // Be slightly more tolerant of a model occasionally wrapping JSON in a
+      // markdown fence despite responseMimeType=json.
+      const cleaned = generated
+        .replace(/^```json\s*/i, '')
+        .replace(/^```\s*/i, '')
+        .replace(/\s*```$/i, '')
+        .trim();
+
+      try {
+        result = JSON.parse(cleaned);
+      } catch {
+        lastError = new Error('Gemini returned an invalid conversation format.');
+        console.error(`[tarot-omen] Conversation Gemini attempt ${attempt}:`, lastError, generated.slice(0, 800));
+        if (attempt < 2) {
+          await sleep(500);
+          continue;
+        }
+        throw lastError;
+      }
+    }
+
+    const reply = capText(typeof result?.reply === 'string' ? result.reply.trim() : '', 1800);
+    if (!reply) {
+      lastError = new Error('Gemini returned an empty conversation reply.');
+      console.error(`[tarot-omen] Conversation Gemini attempt ${attempt}:`, lastError, result);
+      if (attempt < 2) {
+        await sleep(500);
+        continue;
+      }
+      throw lastError;
+    }
+
+    return {
+      reply,
+      offerReading: result?.offer_reading === true
+    };
   }
 
-  let data;
-  try { data = JSON.parse(raw); }
-  catch { throw new Error(`Gemini returned invalid JSON (HTTP ${response.status}).`); }
-  if (!response.ok) throw new Error(data?.error?.message || `Gemini API HTTP ${response.status}`);
-
-  const generated = data?.candidates?.[0]?.content?.parts
-    ?.filter((part) => typeof part.text === 'string')
-    .map((part) => part.text)
-    .join('')
-    .trim();
-  if (!generated) throw new Error('Gemini returned an empty conversation response.');
-
-  let result;
-  try { result = JSON.parse(generated); }
-  catch { throw new Error('Gemini returned an invalid conversation format.'); }
-
-  const reply = capText(typeof result?.reply === 'string' ? result.reply.trim() : '', 1800);
-  if (!reply) throw new Error('Gemini returned an empty conversation reply.');
-
-  return {
-    reply,
-    offerReading: result?.offer_reading === true
-  };
+  throw lastError || new Error('Gemini conversation failed.');
 }
 
 app.post('/api/interpret', async (req, res) => {
@@ -614,7 +694,10 @@ async function buildReadingImage(cards) {
 // conversation/payment storage can be added later without changing the reading logic.
 const sessions = new Map();
 const FREE_CONVERSATION_LIMIT = 3;
-const FREE_VOICE_REPLIES = 3;
+// Voice is NOT part of the free conversation. It is generated only for the
+// initial free reading and for subsequent readings after paid continuation is
+// granted by the future payment flow.
+const PAID_CONTINUATION_DEFAULT = false;
 
 // ===== TELEGRAM =====
 
@@ -871,19 +954,9 @@ async function handleTelegramUpdate(update) {
       session.history.push({ role: 'user', text });
       session.history.push({ role: 'omen', text: result.reply });
 
-      // Voice is available for the first three free follow-up replies only.
-      if (session.voiceRepliesUsed < FREE_VOICE_REPLIES) {
-        try {
-          const voiceBuffer = await elevenLabsTextToSpeech(result.reply);
-          if (voiceBuffer) {
-            await telegramSendVoice(chatId, voiceBuffer);
-            session.voiceRepliesUsed += 1;
-          }
-        } catch (voiceErr) {
-          console.error('[tarot-omen] Conversation voice failed; continuing with text:', voiceErr);
-        }
-      }
-
+      // IMPORTANT: free conversation is text-only. ElevenLabs is never called
+      // for these follow-up messages. Voice becomes available only after a paid
+      // continuation is granted, and then only when a new Tarot spread is made.
       await telegramSendMessage(chatId, result.reply);
 
       if (result.offerReading) {
@@ -911,7 +984,7 @@ async function handleTelegramUpdate(update) {
   if (session?.reading && session.freeConversationUsed >= FREE_CONVERSATION_LIMIT) {
     await telegramSendMessage(
       chatId,
-      'Если хочешь продолжить эту историю, можно посмотреть её глубже отдельным раскладом.'
+      'Если чувствуешь, что здесь хочется пойти дальше, можем посмотреть этот вопрос отдельным раскладом.'
     );
     return;
   }
@@ -939,12 +1012,18 @@ async function handleTelegramUpdate(update) {
 
     const result = await interpretationPromise;
 
-    // First reading always gets voice + text.
-    try {
-      const voiceBuffer = await elevenLabsTextToSpeech(result.voiceInterpretation);
-      if (voiceBuffer) await telegramSendVoice(chatId, voiceBuffer);
-    } catch (voiceErr) {
-      console.error('[tarot-omen] Initial voice generation failed; continuing with text:', voiceErr);
+    // Voice entitlement: the first reading is free and includes voice.
+    // Any later reading must have paidContinuation=true. Free conversation
+    // messages never reach ElevenLabs.
+    const includeVoice = !session || session.paidContinuation === true;
+
+    if (includeVoice) {
+      try {
+        const voiceBuffer = await elevenLabsTextToSpeech(result.voiceInterpretation);
+        if (voiceBuffer) await telegramSendVoice(chatId, voiceBuffer);
+      } catch (voiceErr) {
+        console.error('[tarot-omen] Reading voice generation failed; continuing with text:', voiceErr);
+      }
     }
 
     await telegramSendMessage(chatId, result.interpretation);
@@ -958,7 +1037,7 @@ async function handleTelegramUpdate(update) {
       },
       history: [],
       freeConversationUsed: 0,
-      voiceRepliesUsed: 0,
+      paidContinuation: PAID_CONTINUATION_DEFAULT,
       readingOfferShown: false
     });
   } catch (err) {
