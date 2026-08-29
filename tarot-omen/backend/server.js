@@ -94,7 +94,7 @@ For every spread:
 Return ONLY valid JSON with exactly one string field:
 {"interpretation":"..."}`;
 
-async function generateInterpretation(question, cards, userName = '', spreadType = 'three') {
+async function generateInterpretation(question, cards, userName = '', spreadType = 'three', conversationContext = '') {
   if (!GEMINI_API_KEY) {
     throw new Error('GEMINI_API_KEY is not configured on the server.');
   }
@@ -125,7 +125,10 @@ async function generateInterpretation(question, cards, userName = '', spreadType
     .join('\n\n');
 
   const spreadLabel = spreadType === 'celtic' ? 'Celtic Cross (10 cards)' : 'Three-card reading (3 cards)';
-  const userMessage = `Telegram first name: ${userName || '(not available)'}\nNever infer gender. Use the name only if natural.\n\nSpread type: ${spreadLabel}\n\nUser's question:\n"${question.trim()}"\n\nDrawn spread:\n\n${cardBlock}`;
+  const contextBlock = spreadType === 'celtic' && conversationContext
+    ? `\n\nPrevious conversation context from the same story:\n${conversationContext}`
+    : '';
+  const userMessage = `Telegram first name: ${userName || '(not available)'}\nNever infer gender. Use the name only if natural.\n\nSpread type: ${spreadLabel}\n\nUser's question:\n"${question.trim()}"${contextBlock}\n\nDrawn spread:\n\n${cardBlock}`;
 
   let response;
   let raw;
@@ -1251,6 +1254,38 @@ async function telegramSendPaymentUrl(chatId, text, url) {
   }
 }
 
+async function offerPaidContinuation(chatId, session, readingQuestion = '') {
+  const question = (readingQuestion || '').trim() ||
+    'Посмотреть следующий слой этой истории отдельным раскладом';
+
+  session.pendingReadingQuestion = question;
+  session.readingOfferShown = true;
+  session.pendingGiftReading = false;
+
+  await telegramSendInlineKeyboard(
+    chatId,
+    'Если хочешь продолжить эту историю сейчас, можно открыть следующий расклад. После оплаты ты получишь два расклада: один сейчас и ещё один — в подарок. Если не спешишь, можно подождать 72 часа — после этого снова будет доступен бесплатный расклад, и мы продолжим эту же историю.',
+    [
+      [{ text: `⭐ Telegram Stars — ${PAID_READING_STARS}`, callback_data: 'pay:stars:reading' }],
+      [{ text: `💳 Карта — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB:CARD' }],
+      [{ text: `🏦 СБП — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB:SBP' }],
+      [{ text: `🌍 Зарубежная карта — $${LAVA_READING_USD}`, callback_data: 'pay:lava:reading:USD' }],
+      [{ text: '🧪 Кельтский крест — тест бесплатно', callback_data: 'test:celtic:payment' }]
+    ]
+  );
+}
+
+async function offerGiftReading(chatId, session) {
+  session.pendingGiftReading = true;
+  session.readingOfferShown = false;
+
+  await telegramSendInlineKeyboard(
+    chatId,
+    'В этом продолжении у тебя остался ещё один расклад в подарок. Можем использовать его сейчас или оставить на потом — он никуда не исчезнет.',
+    [[{ text: '🔮 Использовать подарок', callback_data: 'gift:reading' }]]
+  );
+}
+
 async function handleLavaWebhook(body) {
   const event = String(
     findFirstDeepValue(body, ['event', 'eventType', 'type']) || ''
@@ -1452,14 +1487,24 @@ async function handlePreCheckoutQuery(query) {
   await telegramAnswerPreCheckoutQuery(query.id, true);
 }
 
-async function runPaidCelticReading(chatId, session, question) {
+async function runPaidCelticReading(chatId, session, question, options = {}) {
   const userName = session.userName || '';
   const cards = drawCelticCrossCards();
+  const previousReading = session.reading?.spreadType === 'three' ? session.reading : null;
+  const historyBlock = Array.isArray(session.history) && session.history.length
+    ? session.history.slice(-12).map((item) => `${item.role === 'user' ? 'User' : 'Omen'}: ${item.text}`).join('\n')
+    : '';
+  const contextParts = [];
+  if (previousReading) {
+    contextParts.push(`Original three-card question: ${previousReading.question}\nOriginal three-card interpretation: ${previousReading.interpretation}`);
+  }
+  if (historyBlock) contextParts.push(`Conversation after the three-card reading:\n${historyBlock}`);
+  const conversationContext = contextParts.join('\n\n');
 
   try {
     const mixingMessageIds = await telegramSendMessage(chatId, 'Мешаю карты...', true);
     const shuffleMessageId = await telegramSendShuffleGif(chatId);
-    const interpretationPromise = generateInterpretation(question, cards, userName, 'celtic');
+    const interpretationPromise = generateInterpretation(question, cards, userName, 'celtic', conversationContext);
     const spreadImage = await buildCelticCrossImage(cards);
 
     await telegramSendSpreadImage(chatId, spreadImage);
@@ -1489,7 +1534,8 @@ async function runPaidCelticReading(chatId, session, question) {
       question,
       cards,
       interpretation: result.interpretation,
-      spreadType: 'celtic'
+      spreadType: 'celtic',
+      isCelticTest: options.test === true
     };
     session.history = Array.isArray(session.history) ? session.history.slice(-24) : [];
     session.paidConversationUsed = 0;
@@ -1569,15 +1615,10 @@ async function runPaidThreeCardReading(chatId, session, question) {
 }
 
 async function sendStartMessage(chatId) {
-  const replyMarkup = {
-    inline_keyboard: [
-      [{ text: '🃏 Тест Кельтского креста — бесплатно', callback_data: 'test:celtic' }]
-    ]
-  };
   const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text: 'Задавай свой вопрос', reply_markup: replyMarkup })
+    body: JSON.stringify({ chat_id: chatId, text: 'Задавай свой вопрос' })
   });
   if (!response.ok) {
     throw new Error(`Telegram start message failed: ${await response.text()}`);
@@ -1585,20 +1626,43 @@ async function sendStartMessage(chatId) {
 }
 
 async function runFreeTestCelticReading(chatId, session) {
-  if (!session) {
-    throw new Error('Сначала нужен расклад.');
+  if (!session?.reading) {
+    throw new Error('Сначала нужен основной расклад.');
   }
 
   const question =
     session.pendingReadingQuestion ||
-    session.reading?.question ||
-    'Что мне важно увидеть сейчас?';
+    session.reading.question ||
+    'Посмотреть эту историю глубже';
 
-  await telegramSendMessage(
-    chatId,
-    '🧪 Тестовый запуск Кельтского креста — бесплатно. В обычном режиме здесь будет оплата.'
-  );
-  await runPaidCelticReading(chatId, session, question);
+  const snapshot = {
+    reading: session.reading,
+    history: Array.isArray(session.history) ? [...session.history] : [],
+    freeConversationUsed: session.freeConversationUsed,
+    paidConversationUsed: session.paidConversationUsed,
+    paidReadingsRemaining: session.paidReadingsRemaining,
+    paidReadingActive: session.paidReadingActive,
+    paidPackageKind: session.paidPackageKind,
+    paidContinuation: session.paidContinuation,
+    pendingGiftReading: session.pendingGiftReading,
+    readingOfferShown: session.readingOfferShown,
+    pendingReadingQuestion: session.pendingReadingQuestion,
+    pendingPayment: session.pendingPayment,
+    pendingLavaPayment: session.pendingLavaPayment,
+    freeCooldownUsed: session.freeCooldownUsed,
+    freeCooldownAvailableAt: session.freeCooldownAvailableAt,
+    lastPaidReadingAt: session.lastPaidReadingAt
+  };
+
+  try {
+    await telegramSendMessage(
+      chatId,
+      '🧪 Кельтский крест — тест бесплатно. Сейчас Omen посмотрит всю эту же историю глубже, сохранив контекст твоего вопроса и предыдущего разговора.'
+    );
+    await runPaidCelticReading(chatId, session, question, { test: true });
+  } finally {
+    Object.assign(session, snapshot);
+  }
 }
 
 async function handleTelegramUpdate(update) {
@@ -1621,7 +1685,10 @@ async function handleTelegramUpdate(update) {
     const chatId = callback.message?.chat?.id;
     const session = sessions.get(chatId);
     try {
-      if (callback.data === 'test:celtic') {
+      if (callback.data === 'test:celtic:payment') {
+        await runFreeTestCelticReading(chatId, session);
+      } else if (callback.data === 'test:celtic') {
+        // Backward compatibility for an older test button; no longer exposed in /start.
         await runFreeTestCelticReading(chatId, session);
       } else if (callback.data === 'pay:stars:reading') {
         await createPaymentInvoice(chatId, session, 'reading', 'STARS');
@@ -1722,19 +1789,6 @@ async function handleTelegramUpdate(update) {
     await sendStartMessage(chatId);
     return;
   }
-
-  // TEMPORARY TEST MODE: remove this command and the test button before public launch.
-  if (text === '/testceltic') {
-    const currentSession = sessions.get(chatId);
-    try {
-      await runFreeTestCelticReading(chatId, currentSession);
-    } catch (err) {
-      console.error('[tarot-omen] Free Celtic test failed:', err);
-      await telegramSendMessage(chatId, 'Не удалось запустить тестовый Кельтский крест.');
-    }
-    return;
-  }
-
   if (rateLimited(`tg:${chatId}`)) {
     await telegramSendMessage(chatId, 'Слишком много запросов подряд. Попробуй через пару минут.');
     return;
