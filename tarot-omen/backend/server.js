@@ -759,11 +759,12 @@ async function generateConversationResponse({ userName, originalQuestion, cards,
   const userMessage = `Telegram first name: ${userName || '(not available)'}\n\nSpread type: ${spreadLabel}\n\nOriginal question:\n"${originalQuestion}"\n\nCards from the completed reading:\n${cardBlock}\n\nOriginal interpretation:\n${interpretation}\n\nConversation so far:\n${historyBlock}\n\nLatest user message:\n"${latestMessage}"\n\nConversation allowance: this reply is message ${conversationUsed + 1} of ${conversationLimit}; ${remainingMessages} message(s) remain before the current free conversation window ends. Do not mention this allowance to the user. If a genuinely new layer/question has emerged, prefer setting reading_offer=true so the next spread can become the natural continuation. If no new layer has emerged, do not invent one just to sell a spread.`;
 
   let lastError;
+  let response = null;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 60000);
     try {
-      const response = await fetch(
+      response = await fetch(
         'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent',
         {
           method: 'POST',
@@ -913,6 +914,48 @@ async function telegramSendMessage(chatId, text, returnMessageIds = false) {
   }
 
   return returnMessageIds ? messageIds : undefined;
+}
+
+async function telegramSendMessageWithRetry(chatId, text, attempts = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await telegramSendMessage(chatId, text);
+    } catch (err) {
+      lastError = err;
+      if (attempt < attempts) await sleep(attempt * 700);
+    }
+  }
+  throw lastError || new Error('Telegram message delivery failed.');
+}
+
+async function telegramSendInlineKeyboard(chatId, text, buttons) {
+  const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      reply_markup: { inline_keyboard: buttons }
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Telegram sendMessage with keyboard failed: ${await response.text()}`);
+  }
+}
+
+async function telegramSendInlineKeyboardWithRetry(chatId, text, buttons, attempts = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await telegramSendInlineKeyboard(chatId, text, buttons);
+    } catch (err) {
+      lastError = err;
+      if (attempt < attempts) await sleep(attempt * 700);
+    }
+  }
+  throw lastError || new Error('Telegram keyboard delivery failed.');
 }
 
 async function telegramSendOracle(chatId) {
@@ -1262,7 +1305,7 @@ async function offerPaidContinuation(chatId, session, readingQuestion = '') {
   session.readingOfferShown = true;
   session.pendingGiftReading = false;
 
-  await telegramSendInlineKeyboard(
+  await telegramSendInlineKeyboardWithRetry(
     chatId,
     'Если хочешь продолжить эту историю сейчас, можно открыть следующий расклад. После оплаты ты получишь два расклада: один сейчас и ещё один — в подарок. Если не спешишь, можно подождать 72 часа — после этого снова будет доступен бесплатный расклад, и мы продолжим эту же историю.',
     [
@@ -1897,8 +1940,9 @@ async function handleTelegramUpdate(update) {
 
   // ===== PAID CONVERSATION AFTER A PAID READING =====
   if (session?.reading && session.paidContinuation === true && session.paidConversationUsed < PAID_CONVERSATION_LIMIT) {
+    let result;
     try {
-      const result = await generateConversationResponse({
+      result = await generateConversationResponse({
         userName,
         originalQuestion: session.reading.question,
         cards: session.reading.cards,
@@ -1909,46 +1953,65 @@ async function handleTelegramUpdate(update) {
         conversationLimit: PAID_CONVERSATION_LIMIT,
         spreadType: session.reading.spreadType || 'three'
       });
+    } catch (err) {
+      console.error('[tarot-omen] Gemini paid conversation generation failed:', err);
+      await telegramSendMessageWithRetry(chatId, 'Не смог сейчас продолжить мысль. Попробуй ещё раз.');
+      return;
+    }
 
-      session.paidConversationUsed += 1;
-      if (result.readingOffer && result.readingQuestion) {
-        session.pendingReadingQuestion = result.readingQuestion;
-      }
+    session.paidConversationUsed += 1;
+    if (result.readingOffer && result.readingQuestion) {
+      session.pendingReadingQuestion = result.readingQuestion;
+    }
 
-      session.history.push({ role: 'user', text });
-      session.history.push({ role: 'omen', text: result.reply });
-      session.history.push({ role: 'omen', text: result.nextMessage });
-      session.history = session.history.slice(-24);
+    session.history.push({ role: 'user', text });
+    session.history.push({ role: 'omen', text: result.reply });
+    session.history.push({ role: 'omen', text: result.nextMessage });
+    session.history = session.history.slice(-24);
 
-      await telegramSendMessage(chatId, result.reply);
-      await telegramSendMessage(chatId, result.nextMessage);
+    try {
+      await telegramSendMessageWithRetry(chatId, result.reply);
+    } catch (sendErr) {
+      console.error('[tarot-omen] Telegram paid conversation reply delivery failed:', sendErr);
+      return;
+    }
 
-      if (session.paidConversationUsed >= PAID_CONVERSATION_LIMIT) {
-        session.paidReadingActive = false;
-        session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
-        if (Number(session.paidReadingsRemaining || 0) > 0) {
+    if (session.paidConversationUsed >= PAID_CONVERSATION_LIMIT) {
+      session.paidReadingActive = false;
+      session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
+      if (Number(session.paidReadingsRemaining || 0) > 0) {
+        try {
           await offerGiftReading(chatId, session);
-        } else {
-          session.readingOfferShown = false;
+        } catch (offerErr) {
+          console.error('[tarot-omen] Gift reading offer delivery failed:', offerErr);
+        }
+      } else {
+        session.readingOfferShown = false;
+        try {
           await offerPaidContinuation(
             chatId,
             session,
             session.pendingReadingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом'
           );
+        } catch (offerErr) {
+          console.error('[tarot-omen] Paid continuation offer delivery failed:', offerErr);
         }
       }
-      return;
-    } catch (err) {
-      console.error('[tarot-omen] Paid conversation error:', err);
-      await telegramSendMessage(chatId, 'Не смог сейчас продолжить мысль. Попробуй ещё раз.');
-      return;
+    } else {
+      try {
+        await telegramSendMessageWithRetry(chatId, result.nextMessage);
+      } catch (sendErr) {
+        console.error('[tarot-omen] Telegram paid next-message delivery failed:', sendErr);
+      }
     }
+    return;
   }
 
   // ===== FREE CONVERSATION AFTER A COMPLETED READING =====
   if (session?.reading && session.freeConversationUsed < FREE_CONVERSATION_LIMIT) {
+    let result;
     try {
-      const result = await generateConversationResponse({
+      result = await generateConversationResponse({
         userName,
         originalQuestion: session.reading.question,
         cards: session.reading.cards,
@@ -1959,34 +2022,50 @@ async function handleTelegramUpdate(update) {
         conversationLimit: FREE_CONVERSATION_LIMIT,
         spreadType: session.reading.spreadType || 'three'
       });
-
-      session.freeConversationUsed += 1;
-      if (result.readingOffer && result.readingQuestion) {
-        // Remember the emerging new layer, but DO NOT show a payment wall yet.
-        // The user must first receive the full short free conversation.
-        session.pendingReadingQuestion = result.readingQuestion;
-      }
-
-      session.history.push({ role: 'user', text });
-      session.history.push({ role: 'omen', text: result.reply });
-      session.history.push({ role: 'omen', text: result.nextMessage });
-      session.history = session.history.slice(-24);
-
-      await telegramSendMessage(chatId, result.reply);
-
-      if (session.freeConversationUsed >= FREE_CONVERSATION_LIMIT) {
-        session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
-        const offerQuestion = session.pendingReadingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом';
-        await offerPaidContinuation(chatId, session, offerQuestion);
-      } else {
-        await telegramSendMessage(chatId, result.nextMessage);
-      }
-      return;
     } catch (err) {
-      console.error('[tarot-omen] Telegram conversation error:', err);
-      await telegramSendMessage(chatId, 'Не смог сейчас продолжить мысль. Попробуй ещё раз.');
+      console.error('[tarot-omen] Gemini conversation generation failed:', err);
+      await telegramSendMessageWithRetry(chatId, 'Не смог сейчас продолжить мысль. Попробуй ещё раз.');
       return;
     }
+
+    // The Gemini response is now complete before we mutate state or send Telegram messages.
+    session.freeConversationUsed += 1;
+    if (result.readingOffer && result.readingQuestion) {
+      session.pendingReadingQuestion = result.readingQuestion;
+    }
+
+    session.history.push({ role: 'user', text });
+    session.history.push({ role: 'omen', text: result.reply });
+    session.history.push({ role: 'omen', text: result.nextMessage });
+    session.history = session.history.slice(-24);
+
+    // A Telegram delivery failure must never be reported as a Gemini failure after
+    // the reply has already reached the user. Retry each message independently.
+    try {
+      await telegramSendMessageWithRetry(chatId, result.reply);
+    } catch (sendErr) {
+      console.error('[tarot-omen] Telegram conversation reply delivery failed:', sendErr);
+      return;
+    }
+
+    if (session.freeConversationUsed >= FREE_CONVERSATION_LIMIT) {
+      session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
+      const offerQuestion = session.pendingReadingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом';
+      try {
+        await offerPaidContinuation(chatId, session, offerQuestion);
+      } catch (offerErr) {
+        console.error('[tarot-omen] Paid continuation offer delivery failed:', offerErr);
+        // Do not send the generic Gemini error: the conversation reply was already delivered.
+      }
+    } else {
+      try {
+        await telegramSendMessageWithRetry(chatId, result.nextMessage);
+      } catch (sendErr) {
+        console.error('[tarot-omen] Telegram next-message delivery failed:', sendErr);
+        // Do not send a misleading "Не смог сейчас продолжить мысль" after a successful reply.
+      }
+    }
+    return;
   }
 
   try {
