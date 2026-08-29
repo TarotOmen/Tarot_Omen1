@@ -56,6 +56,31 @@ function capText(text, maxLen) {
   return text.slice(0, cut).trim() + '…';
 }
 
+// ===== OMEN DIALOGUE STATE =====
+// The current MVP keeps the active conversation in memory. A persistent store can be
+// added later when payments/accounts are connected.
+const OMEN_FREE_DIALOGUE_MESSAGES = 3;
+const omenSessions = new Map();
+
+function createOmenSession() {
+  return {
+    hasFreeReading: false,
+    initialQuestion: '',
+    initialCards: null,
+    initialInterpretation: '',
+    dialogueMessagesUsed: 0,
+    conversation: [],
+    pendingPaidReading: false
+  };
+}
+
+function getOmenSession(chatId) {
+  if (!omenSessions.has(chatId)) {
+    omenSessions.set(chatId, createOmenSession());
+  }
+  return omenSessions.get(chatId);
+}
+
 const SYSTEM_PROMPT = `You are the reading voice of Tarot Omen, a Tarot mini app.
 
 You receive: a user's question, and three already-drawn Tarot cards (each with its
@@ -234,6 +259,159 @@ async function generateInterpretation(question, cards) {
   }
 
   return { interpretation, voiceInterpretation };
+}
+
+const CONVERSATION_SYSTEM_PROMPT = `You are Omen, a Tarot reader and thoughtful conversational guide.
+
+The user has already received a free three-card Tarot reading. Your task now is to continue a natural conversation about THAT reading and the user's situation.
+
+Rules:
+- Use the original question, the drawn cards, the original interpretation, and the conversation history.
+- Do not draw cards, invent cards, or pretend a new reading has happened.
+- Do not repeat the full original reading. Refer to it naturally when useful.
+- Be attentive to what the user actually says. The goal is to understand the real issue behind the original question.
+- Ask a useful, natural follow-up question when it helps uncover a meaningful new layer.
+- Do not force a sale and do not mention credits, prices, payment, subscriptions, limits, monetization, or being an AI.
+- A new Tarot reading should be suggested ONLY when the conversation has uncovered a genuinely new question or layer that would benefit from looking at the cards.
+- If the user's message is simply a closing/thank-you, respond naturally and do not suggest another reading.
+- If the user is discussing health, never diagnose; keep the Tarot interpretation reflective and recommend a qualified professional when appropriate.
+- If the user is discussing money or finance, never promise a financial outcome.
+- Reply in the same language as the user.
+- Keep the response concise: normally 2-4 short paragraphs.
+
+Return ONLY valid JSON with exactly these two fields:
+{"reply":"...","offer_new_reading":false}
+
+Set offer_new_reading=true only when there is a specific new question worth exploring with a fresh Tarot spread. Otherwise set it to false.`;
+
+async function generateConversationReply(session, userMessage) {
+  if (!GEMINI_API_KEY) {
+    throw new Error('GEMINI_API_KEY is not configured on the server.');
+  }
+
+  const history = session.conversation
+    .slice(-8)
+    .map((item) => `${item.role === 'user' ? 'User' : 'Omen'}: ${item.text}`)
+    .join('\n');
+
+  const cardsText = Array.isArray(session.initialCards)
+    ? session.initialCards
+        .map(
+          (c, i) =>
+            `Card ${i + 1} — ${c.position}; ${c.name}; ${c.orientation}; Keywords: ${c.keywords}`
+        )
+        .join('\n')
+    : 'No cards available.';
+
+  const userMessageForGemini = `Original user question:
+${session.initialQuestion}
+
+Original three-card spread:
+${cardsText}
+
+Original interpretation:
+${session.initialInterpretation}
+
+Conversation so far:
+${history || '(none)'}
+
+New user message:
+${userMessage}`;
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60000);
+
+  const payload = {
+    systemInstruction: { parts: [{ text: CONVERSATION_SYSTEM_PROMPT }] },
+    contents: [{ role: 'user', parts: [{ text: userMessageForGemini }] }],
+    generationConfig: {
+      maxOutputTokens: 1200,
+      responseMimeType: 'application/json'
+    }
+  };
+
+  let response;
+  let raw;
+
+  try {
+    const MAX_ATTEMPTS = 3;
+
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      response = await fetch(
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': GEMINI_API_KEY
+          },
+          body: JSON.stringify(payload),
+          signal: controller.signal
+        }
+      );
+
+      raw = await response.text();
+
+      if (
+        response.ok ||
+        ![429, 500, 502, 503, 504].includes(response.status) ||
+        attempt === MAX_ATTEMPTS
+      ) {
+        break;
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
+    }
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error('Gemini conversation request timed out after 60 seconds.');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  let responseData;
+  try {
+    responseData = JSON.parse(raw);
+  } catch {
+    throw new Error(`Gemini returned invalid JSON (HTTP ${response.status}).`);
+  }
+
+  if (!response.ok) {
+    console.error('[tarot-omen] Gemini conversation API error:', responseData);
+    throw new Error(responseData?.error?.message || `Gemini API HTTP ${response.status}`);
+  }
+
+  const generatedText = responseData?.candidates?.[0]?.content?.parts
+    ?.filter((part) => typeof part.text === 'string')
+    .map((part) => part.text)
+    .join('')
+    .trim();
+
+  if (!generatedText) {
+    throw new Error('Gemini returned an empty conversation response.');
+  }
+
+  let result;
+  try {
+    result = JSON.parse(generatedText);
+  } catch {
+    console.error('[tarot-omen] Gemini returned non-JSON conversation:', generatedText);
+    throw new Error('Gemini returned an invalid conversation format.');
+  }
+
+  const reply =
+    typeof result?.reply === 'string' ? capText(result.reply.trim(), 1800) : '';
+
+  if (!reply) {
+    throw new Error('Gemini returned an empty conversation reply.');
+  }
+
+  return {
+    reply,
+    offerNewReading: result?.offer_new_reading === true
+  };
 }
 
 app.post('/api/interpret', async (req, res) => {
@@ -745,15 +923,12 @@ async function handleTelegramUpdate(update) {
 
   const chatId = message.chat.id;
   const text = String(message.text || '').trim();
+  const session = getOmenSession(chatId);
 
   if (text === '/start') {
-    await telegramSendOracle(chatId);
+    omenSessions.set(chatId, createOmenSession());
 
-    await telegramSendMessage(
-      chatId,
-      'Я оракул Omen. Какой вопрос ты хочешь узнать?\nРасскажи, я разложу карты и Вселенная даст тебе ответ.'
-    );
-
+    await telegramSendMessage(chatId, 'Задавай свой вопрос');
     return;
   }
 
@@ -766,64 +941,107 @@ async function handleTelegramUpdate(update) {
   }
 
   try {
-    // Cards are chosen once. The exact same cards are sent to Gemini and shown to the user.
-    const cards = drawThreeCards();
+    // ===== FIRST FREE READING =====
+    if (!session.hasFreeReading) {
+      // Cards are chosen once. The exact same cards are sent to Gemini and shown to the user.
+      const cards = drawThreeCards();
 
-    // User-facing "mixing" state.
-    const mixingMessageIds = await telegramSendMessage(
-      chatId,
-      'Мешаю карты...',
-      true
-    );
+      const mixingMessageIds = await telegramSendMessage(
+        chatId,
+        'Мешаю карты...',
+        true
+      );
 
-    // GIF stays visible while the image is being prepared and Gemini is thinking.
-    const shuffleMessageId = await telegramSendShuffleGif(chatId);
+      const shuffleMessageId = await telegramSendShuffleGif(chatId);
 
-    // Gemini starts immediately after the cards are chosen.
-    const interpretationPromise = generateInterpretation(text, cards);
+      const interpretationPromise = generateInterpretation(text, cards);
+      const spreadImagePromise = buildReadingImage(cards);
 
-    // The visual spread is prepared in parallel with Gemini.
-    const spreadImagePromise = buildReadingImage(cards);
+      const spreadImage = await spreadImagePromise;
 
-    // Cards appear as soon as the visual spread is ready; do not wait for Gemini.
-    const spreadImage = await spreadImagePromise;
+      await telegramSendSpreadImage(chatId, spreadImage);
 
-    // The mixing text and GIF disappear together when the actual cards are revealed.
-    await telegramSendSpreadImage(chatId, spreadImage);
-
-    for (const messageId of mixingMessageIds || []) {
-      await telegramDeleteMessage(chatId, messageId);
-    }
-    await telegramDeleteMessage(chatId, shuffleMessageId);
-
-    // Persistent explanatory text under the spread.
-    await telegramSendMessage(chatId, CARDS_CAPTION);
-
-    // Deliberate 2-second pause after the cards and explanatory text appear.
-    await sleep(2000);
-
-    // Gemini returns the full reading and a short spoken version of the same reading.
-    const result = await interpretationPromise;
-
-    // Voice is an enhancement for the MVP: if ElevenLabs is unavailable,
-    // the normal text reading still works.
-    try {
-      const voiceBuffer = await elevenLabsTextToSpeech(result.voiceInterpretation);
-      if (voiceBuffer) {
-        await telegramSendVoice(chatId, voiceBuffer);
+      for (const messageId of mixingMessageIds || []) {
+        await telegramDeleteMessage(chatId, messageId);
       }
-    } catch (voiceErr) {
-      console.error('[tarot-omen] Voice generation failed; continuing with text:', voiceErr);
+      await telegramDeleteMessage(chatId, shuffleMessageId);
+
+      await telegramSendMessage(chatId, CARDS_CAPTION);
+      await sleep(2000);
+
+      const result = await interpretationPromise;
+
+      // The first free reading includes one voice message.
+      try {
+        const voiceBuffer = await elevenLabsTextToSpeech(result.voiceInterpretation);
+        if (voiceBuffer) {
+          await telegramSendVoice(chatId, voiceBuffer);
+        }
+      } catch (voiceErr) {
+        console.error('[tarot-omen] Voice generation failed; continuing with text:', voiceErr);
+      }
+
+      await telegramSendMessage(chatId, result.interpretation);
+
+      session.hasFreeReading = true;
+      session.initialQuestion = text;
+      session.initialCards = cards;
+      session.initialInterpretation = result.interpretation;
+      session.dialogueMessagesUsed = 0;
+      session.conversation = [];
+      session.pendingPaidReading = false;
+
+      return;
     }
 
-    await telegramSendMessage(chatId, result.interpretation);
+    // ===== FREE CONVERSATION AFTER THE FIRST READING =====
+    // Free dialogue is text-only. Voice is intentionally not generated here.
+    if (session.pendingPaidReading) {
+      await telegramSendMessage(
+        chatId,
+        'Если хочешь продолжить, следующий расклад будет доступен в платном продолжении. Сейчас мы ещё не подключили оплату.'
+      );
+      return;
+    }
+
+    if (session.dialogueMessagesUsed >= OMEN_FREE_DIALOGUE_MESSAGES) {
+      session.pendingPaidReading = true;
+      await telegramSendMessage(
+        chatId,
+        'Я уже хорошо понимаю твою ситуацию. Если хочешь пойти дальше, можем посмотреть новый вопрос отдельным раскладом. Это будет платное продолжение.'
+      );
+      return;
+    }
+
+    session.dialogueMessagesUsed += 1;
+
+    const conversationResult = await generateConversationReply(session, text);
+
+    session.conversation.push({ role: 'user', text });
+    session.conversation.push({ role: 'omen', text: conversationResult.reply });
+
+    await telegramSendMessage(chatId, conversationResult.reply);
+
+    if (conversationResult.offerNewReading) {
+      session.pendingPaidReading = true;
+      await telegramSendMessage(
+        chatId,
+        '🔮 Хочешь посмотреть это отдельным раскладом? Это будет платное продолжение.'
+      );
+    } else if (session.dialogueMessagesUsed >= OMEN_FREE_DIALOGUE_MESSAGES) {
+      session.pendingPaidReading = true;
+      await telegramSendMessage(
+        chatId,
+        'Если хочешь продолжить разбирать ситуацию, следующий шаг — отдельный расклад. Это будет платное продолжение.'
+      );
+    }
   } catch (err) {
-    console.error('[tarot-omen] Telegram reading error:', err);
+    console.error('[tarot-omen] Telegram reading/conversation error:', err);
 
     try {
       await telegramSendMessage(
         chatId,
-        'Не удалось получить расклад. Попробуй ещё раз.'
+        'Не удалось получить ответ. Попробуй ещё раз.'
       );
     } catch (sendErr) {
       console.error(
