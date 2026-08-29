@@ -603,8 +603,18 @@ Rules:
 - If the user reveals a genuinely new layer that would benefit from another spread, you may gently invite them to look at that specific issue with a separate spread. Never mention payment, credits, limits or sales.
 - If there is no genuinely new question, continue the conversation naturally.
 - Do not force a reading offer merely because a message limit exists.
-- Return ONLY valid JSON with exactly these two fields:
-{"reply":"...","offer_reading":false}`;
+- Return ONLY valid JSON with exactly these three fields:
+{"reply":"...","next_message":"...","next_message_type":"question"}
+
+Rules for next_message:
+- After EVERY reply, provide either a short context-specific question OR a short concluding thought. Never leave the reply hanging without one of these.
+- next_message_type must be exactly "question" or "conclusion".
+- Use "question" when there is a natural, meaningful thing the user can answer that deepens the conversation.
+- Use "conclusion" when the user's latest message closes the current thought, or when another question would feel forced. The conclusion should feel complete, not like a sales message.
+- The next_message is sent as a SEPARATE Telegram message.
+- Never mention payment, credits, limits or sales in next_message.
+- Do not ask a generic question. Connect it to the actual conversation and the reading.
+- Do not repeat the same question or simply rephrase the user's last message.`;
 
 async function generateConversationResponse({ userName, originalQuestion, cards, interpretation, history, latestMessage }) {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not configured on the server.');
@@ -666,8 +676,16 @@ async function generateConversationResponse({ userName, originalQuestion, cards,
         result = JSON.parse(cleaned);
       }
       const reply = capText(typeof result?.reply === 'string' ? result.reply.trim() : '', 1800);
+      const nextMessage = capText(
+        typeof result?.next_message === 'string' ? result.next_message.trim() : '',
+        500
+      );
+      const nextMessageType = result?.next_message_type === 'conclusion' ? 'conclusion' : 'question';
+
       if (!reply) throw new Error('Gemini returned an empty conversation reply.');
-      return { reply, offerReading: result?.offer_reading === true };
+      if (!nextMessage) throw new Error('Gemini returned no next conversation message.');
+
+      return { reply, nextMessage, nextMessageType };
     } catch (err) {
       lastError = err?.name === 'AbortError'
         ? new Error('Gemini conversation request timed out after 60 seconds.')
@@ -939,14 +957,16 @@ async function handleTelegramUpdate(update) {
       // NEVER call ElevenLabs for free follow-up messages.
       await telegramSendMessage(chatId, result.reply);
 
-      if (result.offerReading) session.readingOfferShown = true;
+      // Every conversational answer must either open a meaningful next step
+      // with a question or close the current thought with a complete conclusion.
+      await telegramSendMessage(chatId, result.nextMessage);
 
-      // After the third free reply, end the free conversation gracefully if Omen
-      // did not already offer a new spread.
-      if (session.freeConversationUsed >= FREE_CONVERSATION_LIMIT && !result.offerReading) {
+      // The third free reply ends the free conversational window. We do not
+      // start a new AI chat automatically after that point.
+      if (session.freeConversationUsed >= FREE_CONVERSATION_LIMIT) {
         await telegramSendMessage(
           chatId,
-          'Мне кажется, здесь уже появился отдельный вопрос. Если захочешь, можем посмотреть на него глубже.'
+          'На этом я бы остановился. Если захочешь продолжить эту историю, следующий шаг лучше уже посмотреть отдельным раскладом.'
         );
         session.readingOfferShown = true;
       }
