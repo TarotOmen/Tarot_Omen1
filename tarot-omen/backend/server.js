@@ -674,11 +674,13 @@ async function generateConversationResponse({ userName, originalQuestion, cards,
   const userMessage = `Telegram first name: ${userName || '(not available)'}\n\nOriginal question:\n"${originalQuestion}"\n\nCards from the completed reading:\n${cardBlock}\n\nOriginal interpretation:\n${interpretation}\n\nConversation so far:\n${historyBlock}\n\nLatest user message:\n"${latestMessage}"\n\nConversation allowance: this reply is message ${conversationUsed + 1} of ${conversationLimit}; ${remainingMessages} message(s) remain before the current free conversation window ends. Do not mention this allowance to the user. If a genuinely new layer/question has emerged, prefer setting reading_offer=true so the next spread can become the natural continuation. If no new layer has emerged, do not invent one just to sell a spread.`;
 
   let lastError;
+  let response = null;
+
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 60000);
     try {
-      const response = await fetch(
+      response = await fetch(
         'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent',
         {
           method: 'POST',
@@ -745,9 +747,10 @@ async function generateConversationResponse({ userName, originalQuestion, cards,
       const transient = /high demand|429|503|502|500|temporar/i.test(lastError?.message || '');
       console.error(`[tarot-omen] Conversation attempt ${attempt} failed${transient ? ' (transient Gemini load)' : ''}:`, lastError);
       if (attempt < 3) {
-        const retryAfter = Number(response?.headers?.get?.('retry-after') || 0);
-        const delay = retryAfter > 0
-          ? Math.min(retryAfter * 1000, 10000)
+        const retryAfterHeader = response?.headers?.get?.('retry-after');
+        const retryAfterSeconds = Number(retryAfterHeader || 0);
+        const delay = retryAfterSeconds > 0
+          ? Math.min(retryAfterSeconds * 1000, 10000)
           : attempt * 1800;
         await sleep(delay);
       }
