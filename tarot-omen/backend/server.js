@@ -10,8 +10,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = process.env.PORT || 8787;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-const OMEN_VOICE_ID = process.env.OMEN_VOICE_ID;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
@@ -30,12 +28,6 @@ if (!GEMINI_API_KEY) {
 }
 if (!TELEGRAM_BOT_TOKEN) {
   console.warn('[tarot-omen] WARNING: TELEGRAM_BOT_TOKEN is not set. Telegram bot will not run.');
-}
-if (!ELEVENLABS_API_KEY) {
-  console.warn('[tarot-omen] WARNING: ELEVENLABS_API_KEY is not set. Voice messages will be skipped.');
-}
-if (!OMEN_VOICE_ID) {
-  console.warn('[tarot-omen] WARNING: OMEN_VOICE_ID is not set. Voice messages will be skipped.');
 }
 if (!LAVA_API_KEY) {
   console.warn('[tarot-omen] WARNING: LAVA_API_KEY is not set. Card payments will be unavailable.');
@@ -64,7 +56,6 @@ function rateLimited(key) {
 }
 
 const MAX_INTERPRETATION_CHARS = 3000;
-const MAX_VOICE_CHARS = 280;
 
 function capText(text, maxLen) {
   if (text.length <= maxLen) return text;
@@ -74,66 +65,44 @@ function capText(text, maxLen) {
   return text.slice(0, cut).trim() + '…';
 }
 
-function capVoiceText(text, maxLen = MAX_VOICE_CHARS) {
-  if (text.length <= maxLen) return text;
-  const slice = text.slice(0, maxLen);
-  const breaks = [slice.lastIndexOf('. '), slice.lastIndexOf('! '), slice.lastIndexOf('? '), slice.lastIndexOf('…')];
-  const cut = Math.max(...breaks);
-  return (cut > maxLen * 0.6 ? slice.slice(0, cut + 1) : slice).trim();
-}
 
 const SYSTEM_PROMPT = `You are the reading voice of Tarot Omen, a Tarot mini app.
 
 Speak naturally to one person. You may use the user's Telegram first name when it feels natural, but never infer or mention gender. Prefer gender-neutral wording.
 
-You receive: a user's question, and three already-drawn Tarot cards (each with its
-position, name, and orientation — upright or reversed). The cards were chosen by a
-random generator before you were called. You never choose or invent cards.
+You receive: a user's question and an already-drawn Tarot spread. The cards were chosen by a random generator before you were called. You never choose or invent cards.
 
-Produce TWO versions of the SAME interpretation:
+For a three-card spread:
+- Read the cards by the positions Situation / What Influences It / Where It May Lead.
 
-1) "interpretation": the full text reading.
-- Write one unified, personal interpretation of the spread AS IT RELATES TO THE
-  QUESTION — not a generic listing of card meanings.
-- Read each card in light of its position (The Situation / What Influences It /
-  Where It May Lead) and its orientation.
-- Weave the three cards into one coherent narrative, noting how they interact.
+For a Celtic Cross:
+- Read all 10 cards by their exact positions: Situation / Challenge / Foundation / Recent Past / Conscious Aim / Near Future / Self / External Environment / Hopes and Fears / Outcome.
+
+For every spread:
+- Write one unified, personal interpretation AS IT RELATES TO THE QUESTION — not a generic listing of card meanings.
+- Read each card in light of its position and orientation.
+- Weave the cards into one coherent narrative, noting how they interact.
 - Be specific to the question's actual topic and phrasing.
 - Keep language reflective and open. Never claim certainty about the future.
-- If the question concerns health: never diagnose. Offer only reflective
-  interpretation and gently recommend a qualified professional when appropriate.
+- If the question concerns health: never diagnose. Offer only reflective interpretation and gently recommend a qualified professional when appropriate.
 - If the question concerns money or finance: never promise a financial outcome.
 - Reply in the same language the user's question is written in.
-- Length: about 4 short paragraphs. No headers, no bullet lists, no card-by-card
-  labels — a flowing reading.
+- Length: about 4 short paragraphs for three cards; about 7 short paragraphs for the Celtic Cross.
+- No headers, no bullet lists, no card-by-card labels — a flowing reading.
 
-2) "voice_interpretation": a SHORT spoken version of the same reading for Omen's
-  voice message.
-- It must communicate the most important insight from the full interpretation,
-  not introduce a different meaning.
-- 2 to 4 natural spoken sentences, roughly 160-280 characters when possible.
-- Sound like Omen is personally speaking to one person, not reading an article.
-- Calm, intimate, confident and slightly mysterious, but natural.
-- Use natural pauses and conversational phrasing.
-- Do not say "I will explain", "in the full interpretation", "the cards below",
-  or anything that refers to the text itself.
-- Do not list all three cards mechanically. Choose the most important thread
-  or insight from their interaction.
-- Do not give direct instructions or tell the user what they must do.
-- Reply in the same language as the user's question.
+Return ONLY valid JSON with exactly one string field:
+{"interpretation":"..."}`;
 
-Return ONLY valid JSON with exactly these two string fields:
-{"interpretation":"...","voice_interpretation":"..."}`;
-
-async function generateInterpretation(question, cards, userName = '') {
+async function generateInterpretation(question, cards, userName = '', spreadType = 'three') {
   if (!GEMINI_API_KEY) {
     throw new Error('GEMINI_API_KEY is not configured on the server.');
   }
   if (typeof question !== 'string' || !question.trim() || question.trim().length > 400) {
     throw new Error('Invalid question.');
   }
-  if (!Array.isArray(cards) || cards.length !== 3) {
-    throw new Error('Exactly three cards are required.');
+  const requiredCards = spreadType === 'celtic' ? 10 : 3;
+  if (!Array.isArray(cards) || cards.length !== requiredCards) {
+    throw new Error(`${requiredCards} cards are required for this spread.`);
   }
 
   for (const c of cards) {
@@ -154,27 +123,15 @@ async function generateInterpretation(question, cards, userName = '') {
     )
     .join('\n\n');
 
-  const userMessage = `Telegram first name: ${userName || '(not available)'}\nNever infer gender. Use the name only if natural.\n\nUser's question:\n"${question.trim()}"\n\nDrawn spread:\n\n${cardBlock}`;
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60000);
-
-  const payload = {
-    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-    contents: [{ role: 'user', parts: [{ text: userMessage }] }],
-    generationConfig: {
-      maxOutputTokens: 3000,
-      responseMimeType: 'application/json'
-    }
-  };
+  const spreadLabel = spreadType === 'celtic' ? 'Celtic Cross (10 cards)' : 'Three-card reading (3 cards)';
+  const userMessage = `Telegram first name: ${userName || '(not available)'}\nNever infer gender. Use the name only if natural.\n\nSpread type: ${spreadLabel}\n\nUser's question:\n"${question.trim()}"\n\nDrawn spread:\n\n${cardBlock}`;
 
   let response;
   let raw;
-
-  try {
-    const MAX_ATTEMPTS = 3;
-
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60000);
+    try {
       response = await fetch(
         'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent',
         {
@@ -183,42 +140,46 @@ async function generateInterpretation(question, cards, userName = '') {
             'Content-Type': 'application/json',
             'x-goog-api-key': GEMINI_API_KEY
           },
-          body: JSON.stringify(payload),
+          body: JSON.stringify({
+            systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+            contents: [{ role: 'user', parts: [{ text: userMessage }] }],
+            generationConfig: {
+              maxOutputTokens: spreadType === 'celtic' ? 4500 : 3000,
+              responseMimeType: 'application/json'
+            }
+          }),
           signal: controller.signal
         }
       );
-
       raw = await response.text();
-
       if (
         response.ok ||
         ![429, 500, 502, 503, 504].includes(response.status) ||
-        attempt === MAX_ATTEMPTS
+        attempt === 3
       ) {
         break;
       }
-
-      await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
+      await sleep(attempt * 1500);
+    } catch (err) {
+      if (attempt === 3) {
+        if (err?.name === 'AbortError') throw new Error('Gemini request timed out after 60 seconds.');
+        throw err;
+      }
+    } finally {
+      clearTimeout(timeout);
     }
-  } catch (err) {
-    if (err?.name === 'AbortError') {
-      throw new Error('Gemini request timed out after 60 seconds.');
-    }
-    throw err;
-  } finally {
-    clearTimeout(timeout);
   }
 
   let responseData;
   try {
     responseData = JSON.parse(raw);
   } catch {
-    throw new Error(`Gemini returned invalid JSON (HTTP ${response.status}).`);
+    throw new Error(`Gemini returned invalid JSON (HTTP ${response?.status || 'unknown'}).`);
   }
 
-  if (!response.ok) {
+  if (!response?.ok) {
     console.error('[tarot-omen] Gemini API error:', responseData);
-    throw new Error(responseData?.error?.message || `Gemini API HTTP ${response.status}`);
+    throw new Error(responseData?.error?.message || `Gemini API HTTP ${response?.status}`);
   }
 
   const generatedText = responseData?.candidates?.[0]?.content?.parts
@@ -229,39 +190,30 @@ async function generateInterpretation(question, cards, userName = '') {
 
   if (!generatedText) {
     const reason = responseData?.candidates?.[0]?.finishReason;
-    throw new Error(
-      reason
-        ? `Gemini returned no text (finishReason: ${reason}).`
-        : 'Gemini returned an empty interpretation.'
-    );
+    throw new Error(reason ? `Gemini returned no text (finishReason: ${reason}).` : 'Gemini returned an empty interpretation.');
   }
 
   let result;
   try {
     result = JSON.parse(generatedText);
   } catch {
-    console.error('[tarot-omen] Gemini returned non-JSON interpretation:', generatedText);
-    throw new Error('Gemini returned an invalid interpretation format.');
+    const cleaned = generatedText.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/i, '').trim();
+    try {
+      result = JSON.parse(cleaned);
+    } catch {
+      console.error('[tarot-omen] Gemini returned non-JSON interpretation:', generatedText);
+      throw new Error('Gemini returned an invalid interpretation format.');
+    }
   }
 
+  const maxChars = spreadType === 'celtic' ? 7000 : MAX_INTERPRETATION_CHARS;
   const interpretation = capText(
     typeof result?.interpretation === 'string' ? result.interpretation.trim() : '',
-    MAX_INTERPRETATION_CHARS
+    maxChars
   );
-  const voiceInterpretation =
-    typeof result?.voice_interpretation === 'string'
-      ? result.voice_interpretation.trim()
-      : '';
 
-  if (!interpretation) {
-    throw new Error('Gemini returned an empty interpretation.');
-  }
-
-  if (!voiceInterpretation) {
-    throw new Error('Gemini returned an empty voice interpretation.');
-  }
-
-  return { interpretation, voiceInterpretation };
+  if (!interpretation) throw new Error('Gemini returned an empty interpretation.');
+  return { interpretation };
 }
 
 async function generateFollowupQuestion({ userName, originalQuestion, cards, interpretation }) {
@@ -269,11 +221,11 @@ async function generateFollowupQuestion({ userName, originalQuestion, cards, int
     `Card ${i + 1} — ${c.position}: ${c.name} (${c.orientation})`
   ).join('\n');
 
-  const prompt = `You are Omen, a thoughtful Tarot reader. The user has just received a three-card reading.
+  const prompt = `You are Omen, a thoughtful Tarot reader. The user has just received a Tarot reading.
 Write ONE short, natural question in the same language as the user's original question.
 The question must be specifically connected to the actual question, the cards and the interpretation.
 Its purpose is to make the user want to continue the conversation and tell Omen something meaningful.
-Do not mention payment, limits, credits, products or another spread.
+Do not mention payment, limits, credits or products.
 Do not sound like a survey or a sales funnel.
 Do not ask a generic question such as "Что ты чувствуешь?" unless it is clearly made specific by the context.
 Return ONLY the question, with no quotation marks and no extra text.
@@ -423,6 +375,30 @@ function drawThreeCards() {
     position: positions[index],
     name: card.name,
     orientation: Math.random() < 0.5 ? "upright" : "reversed",
+    keywords: card.keywords
+  }));
+}
+
+
+function drawCelticCrossCards() {
+  const shuffled = [...TAROT_DECK].sort(() => Math.random() - 0.5);
+  const positions = [
+    'Ситуация',
+    'Что пересекает ситуацию',
+    'Основание ситуации',
+    'Недавнее прошлое',
+    'Сознательная цель',
+    'Ближайшее будущее',
+    'Сам человек',
+    'Внешнее окружение',
+    'Надежды и опасения',
+    'Итог'
+  ];
+
+  return shuffled.slice(0, 10).map((card, index) => ({
+    position: positions[index],
+    name: card.name,
+    orientation: Math.random() < 0.5 ? 'upright' : 'reversed',
     keywords: card.keywords
   }));
 }
@@ -611,6 +587,85 @@ async function buildReadingImage(cards) {
     .toBuffer();
 }
 
+
+
+const CELTIC_CARD_HEIGHT_FRACTION = 0.23;
+
+async function buildCelticCrossImage(cards) {
+  if (!Array.isArray(cards) || cards.length !== 10) {
+    throw new Error('Exactly ten cards are required to build the Celtic Cross image.');
+  }
+
+  const tableMeta = await sharp(TABLE_PATH).metadata();
+  const tableWidth = Number(tableMeta.width || 1536);
+  const tableHeight = Number(tableMeta.height || 1024);
+  const targetCardHeight = Math.round(tableHeight * CELTIC_CARD_HEIGHT_FRACTION);
+
+  const layers = await Promise.all(
+    cards.map((card, index) => makeCardLayer(card, index === 1 ? 0 : 0, targetCardHeight))
+  );
+
+  // Classic Celtic Cross: a six-card cross on the left and four-card staff on the right.
+  const positions = [
+    [0.32, 0.50, 0], // 1 Situation
+    [0.32, 0.50, 90], // 2 Challenge / crossing card
+    [0.32, 0.75, 0], // 3 Foundation
+    [0.12, 0.50, 0], // 4 Recent past
+    [0.32, 0.25, 0], // 5 Conscious aim
+    [0.52, 0.50, 0], // 6 Near future
+    [0.78, 0.80, 0], // 7 Self
+    [0.78, 0.60, 0], // 8 Environment
+    [0.78, 0.40, 0], // 9 Hopes / fears
+    [0.78, 0.20, 0]  // 10 Outcome
+  ];
+
+  const composites = [];
+  for (let index = 0; index < cards.length; index += 1) {
+    const angle = positions[index][2];
+    let cardBuffer = layers[index].cardRotated;
+    let shadowBuffer = layers[index].shadow;
+
+    // Card 2 crosses card 1 horizontally.
+    if (index === 1) {
+      const input = await readFile(await cardPathFor(cards[index]));
+      cardBuffer = await sharp(input)
+        .resize({ height: targetCardHeight, fit: 'contain' })
+        .rotate(90 + (cards[index].orientation === 'reversed' ? 180 : 0), { background: { r: 0, g: 0, b: 0, alpha: 0 } })
+        .png()
+        .toBuffer();
+      const meta = await sharp(cardBuffer).metadata();
+      const shadowSvg = Buffer.from(`<svg width="${meta.width}" height="${meta.height}"><rect x="8" y="8" width="${Math.max(1, meta.width-16)}" height="${Math.max(1, meta.height-16)}" rx="10" fill="black" fill-opacity="0.32"/></svg>`);
+      shadowBuffer = await sharp({ create: { width: meta.width, height: meta.height, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } })
+        .composite([{ input: shadowSvg, blend: 'over' }])
+        .blur(12)
+        .png()
+        .toBuffer();
+    }
+
+    const cardMeta = await sharp(cardBuffer).metadata();
+    const shadowMeta = await sharp(shadowBuffer).metadata();
+    const centerX = Math.round(tableWidth * positions[index][0]);
+    const centerY = Math.round(tableHeight * positions[index][1]);
+
+    composites.push({
+      input: shadowBuffer,
+      left: Math.round(centerX - shadowMeta.width / 2 + 8),
+      top: Math.round(centerY - shadowMeta.height / 2 + 8)
+    });
+    composites.push({
+      input: cardBuffer,
+      left: Math.round(centerX - cardMeta.width / 2),
+      top: Math.round(centerY - cardMeta.height / 2)
+    });
+  }
+
+  return sharp(TABLE_PATH)
+    .ensureAlpha()
+    .modulate({ brightness: 1.35, saturation: 1.05 })
+    .composite(composites)
+    .png()
+    .toBuffer();
+}
 // ===== CONVERSATION SESSIONS =====
 // MVP storage: in-memory. A Render restart clears sessions.
 const sessions = new Map();
@@ -641,18 +696,18 @@ if (!Number.isInteger(CELTIC_CROSS_STARS) || CELTIC_CROSS_STARS < 1) {
   throw new Error('CELTIC_CROSS_STARS must be a positive integer.');
 }
 
-const CONVERSATION_SYSTEM_PROMPT = `You are Omen, the same Tarot reader who has just completed a three-card reading.
+const CONVERSATION_SYSTEM_PROMPT = `You are Omen, the same Tarot reader who has just completed a Tarot reading.
 You are now having a short, personal conversation about that reading.
 
 Rules:
-- Understand the original question, the three cards, the original interpretation, the conversation history and the latest user message.
+- Understand the original question, all cards in the completed spread, the original interpretation, the conversation history and the latest user message.
 - Answer the latest message directly. Do not generate a new Tarot reading in this stage.
 - Be natural, perceptive, warm and concise. Usually 1-3 short paragraphs.
 - Never invent facts about the user's life.
 - Never claim certainty about the future.
 - Never assume or mention gender. Use the Telegram first name only when it sounds natural.
 - If the user reveals a genuinely new layer that would benefit from another spread, set reading_offer to true and formulate one specific reading_question for that new layer. This is only a signal for the server; NEVER sell, charge, or end the conversation yourself. Do not mention payment, credits, limits or sales inside reply or next_message.
-- If there is no genuinely new layer, continue the conversation naturally around the EXISTING three-card reading.
+- If there is no genuinely new layer, continue the conversation naturally around the EXISTING reading.
 - A new user question does NOT automatically mean a new Tarot spread. Never generate or imply a new spread in this stage.
 - During this conversation stage, answer the user's latest message directly using the existing reading and history.
 - When the current free conversation window is ending, NEVER write a phrase like "На этом я бы остановился", "завершим", "на этом закончим" or any equivalent solely because the limit has been reached. The conversation should end naturally, or transition to a specific new reading only when the user's context genuinely creates one.
@@ -670,19 +725,20 @@ Rules for next_message:
 - Do not ask a generic question. Connect it to the actual conversation and the reading.
 - Do not repeat the same question or simply rephrase the user's last message.`;
 
-async function generateConversationResponse({ userName, originalQuestion, cards, interpretation, history, latestMessage, conversationUsed = 0, conversationLimit = FREE_CONVERSATION_LIMIT }) {
+async function generateConversationResponse({ userName, originalQuestion, cards, interpretation, history, latestMessage, conversationUsed = 0, conversationLimit = FREE_CONVERSATION_LIMIT, spreadType = 'three' }) {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not configured on the server.');
 
   const cardBlock = cards.map((c, i) =>
     `Card ${i + 1} — ${c.position}\nName: ${c.name}\nOrientation: ${c.orientation}\nKeywords: ${c.keywords}`
   ).join('\n\n');
+  const spreadLabel = spreadType === 'celtic' ? 'Celtic Cross (10 cards)' : 'three-card reading (3 cards)';
 
   const historyBlock = history.length
     ? history.map((item) => `${item.role === 'user' ? 'User' : 'Omen'}: ${item.text}`).join('\n')
     : '(no previous conversation messages)';
 
   const remainingMessages = Math.max(0, conversationLimit - conversationUsed);
-  const userMessage = `Telegram first name: ${userName || '(not available)'}\n\nOriginal question:\n"${originalQuestion}"\n\nCards from the completed reading:\n${cardBlock}\n\nOriginal interpretation:\n${interpretation}\n\nConversation so far:\n${historyBlock}\n\nLatest user message:\n"${latestMessage}"\n\nConversation allowance: this reply is message ${conversationUsed + 1} of ${conversationLimit}; ${remainingMessages} message(s) remain before the current free conversation window ends. Do not mention this allowance to the user. If a genuinely new layer/question has emerged, prefer setting reading_offer=true so the next spread can become the natural continuation. If no new layer has emerged, do not invent one just to sell a spread.`;
+  const userMessage = `Telegram first name: ${userName || '(not available)'}\n\nSpread type: ${spreadLabel}\n\nOriginal question:\n"${originalQuestion}"\n\nCards from the completed reading:\n${cardBlock}\n\nOriginal interpretation:\n${interpretation}\n\nConversation so far:\n${historyBlock}\n\nLatest user message:\n"${latestMessage}"\n\nConversation allowance: this reply is message ${conversationUsed + 1} of ${conversationLimit}; ${remainingMessages} message(s) remain before the current free conversation window ends. Do not mention this allowance to the user. If a genuinely new layer/question has emerged, prefer setting reading_offer=true so the next spread can become the natural continuation. If no new layer has emerged, do not invent one just to sell a spread.`;
 
   let lastError;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -930,144 +986,6 @@ async function telegramSendSpreadImage(chatId, imageBuffer) {
   if (!response.ok) {
     throw new Error(`Telegram sendPhoto (spread) failed: ${await response.text()}`);
   }
-}
-
-async function elevenLabsTextToSpeech(text) {
-  if (!ELEVENLABS_API_KEY || !OMEN_VOICE_ID) {
-    return null;
-  }
-
-  const response = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(OMEN_VOICE_ID)}?output_format=mp3_44100_128`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'xi-api-key': ELEVENLABS_API_KEY
-      },
-      body: JSON.stringify({
-        text,
-        model_id: 'eleven_v3'
-      })
-    }
-  );
-
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`ElevenLabs TTS failed: ${body}`);
-  }
-
-  return Buffer.from(await response.arrayBuffer());
-}
-
-async function telegramSendVoice(chatId, audioBuffer) {
-  if (!audioBuffer) return;
-
-  const form = new FormData();
-  form.append('chat_id', String(chatId));
-  form.append(
-    'voice',
-    new Blob([audioBuffer], { type: 'audio/mpeg' }),
-    'omen.mp3'
-  );
-
-  const response = await fetch(`${TELEGRAM_API}/sendVoice`, {
-    method: 'POST',
-    body: form
-  });
-
-  if (!response.ok) {
-    throw new Error(`Telegram sendVoice failed: ${await response.text()}`);
-  }
-}
-
-async function telegramAnswerPreCheckoutQuery(queryId, ok, errorMessage = '') {
-  const body = {
-    pre_checkout_query_id: queryId,
-    ok
-  };
-  if (!ok && errorMessage) body.error_message = errorMessage;
-
-  const response = await fetch(`${TELEGRAM_API}/answerPreCheckoutQuery`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-
-  if (!response.ok) {
-    throw new Error(`Telegram answerPreCheckoutQuery failed: ${await response.text()}`);
-  }
-}
-
-async function telegramSendInvoice(chatId, { title, description, stars, payload }) {
-  const response = await fetch(`${TELEGRAM_API}/sendInvoice`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatId,
-      title,
-      description,
-      payload,
-      currency: 'XTR',
-      prices: [{ label: title, amount: stars }],
-      start_parameter: `omen_${String(payload).replace(/[^A-Za-z0-9_-]/g, '_').slice(-48)}`
-    })
-  });
-
-  if (!response.ok) {
-    throw new Error(`Telegram sendInvoice failed: ${await response.text()}`);
-  }
-
-  const data = await response.json();
-  if (!data.ok) throw new Error(data.description || 'Telegram sendInvoice failed.');
-  return data.result;
-}
-
-async function telegramSendInlineKeyboard(chatId, text, buttons) {
-  const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text,
-      reply_markup: { inline_keyboard: buttons }
-    })
-  });
-
-  if (!response.ok) {
-    throw new Error(`Telegram sendMessage with keyboard failed: ${await response.text()}`);
-  }
-}
-
-async function offerPaidContinuation(chatId, session, readingQuestion = '') {
-  const question = (readingQuestion || '').trim() ||
-    'Посмотреть следующий слой этой истории отдельным раскладом';
-
-  session.pendingReadingQuestion = question;
-  session.readingOfferShown = true;
-  session.pendingGiftReading = false;
-
-  await telegramSendInlineKeyboard(
-    chatId,
-    'Если хочешь продолжить эту историю сейчас, можно открыть следующий расклад. После оплаты ты получишь два расклада: один сейчас и ещё один — в подарок. Если не спешишь, можно подождать 72 часа — после этого снова будет доступен бесплатный расклад, и мы продолжим эту же историю.',
-    [
-      [{ text: `⭐ Telegram Stars — ${PAID_READING_STARS}`, callback_data: 'pay:stars:reading' }],
-      [{ text: `💳 Карта — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB:CARD' }],
-      [{ text: `🏦 СБП — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB:SBP' }],
-      [{ text: `🌍 Зарубежная карта — $${LAVA_READING_USD}`, callback_data: 'pay:lava:reading:USD' }]
-    ]
-  );
-}
-
-async function offerGiftReading(chatId, session) {
-  session.pendingGiftReading = true;
-  session.readingOfferShown = false;
-
-  await telegramSendInlineKeyboard(
-    chatId,
-    'В этом продолжении у тебя остался ещё один расклад в подарок. Можем использовать его сейчас или оставить на потом — он никуда не исчезнет.',
-    [[{ text: '🔮 Использовать подарок', callback_data: 'gift:reading' }]]
-  );
 }
 
 function lavaSyntheticEmail(chatId, kind) {
@@ -1384,14 +1302,13 @@ async function handleLavaWebhook(body) {
   session.pendingLavaPayment = null;
   activatePaidPackage(session, kindFromEmail);
 
-  await telegramSendMessage(chatId, 'Оплата прошла. В пакет входят два расклада: один сейчас и ещё один — в подарок. Начинаем первый.');
-
   if (kindFromEmail === 'celtic') {
-    // Celtic Cross is intentionally not executed until its 10-card visual flow is installed.
-    await telegramSendMessage(chatId, 'Кельтский крест уже оплачен. Визуализацию этого расклада подключим следующим этапом. Второй расклад останется доступен в подарок.');
+    await telegramSendMessage(chatId, 'Оплата прошла. Запускаю Кельтский крест — 10 карт и подробный разбор.');
+    await runPaidCelticReading(chatId, session, question);
     return;
   }
 
+  await telegramSendMessage(chatId, 'Оплата прошла. В пакет входят два расклада: один сейчас и ещё один — в подарок. Начинаем первый.');
   await runPaidThreeCardReading(chatId, session, question);
 }
 
@@ -1401,41 +1318,43 @@ async function createPaymentInvoice(chatId, session, kind, currency = 'RUB', pay
     return;
   }
 
-  if (kind === 'celtic') {
-    await telegramSendMessage(
-      chatId,
-      'Кельтский крест будет отдельным платным форматом. Его оплату подключим вместе с готовой визуализацией.'
-    );
-    return;
-  }
-
-  const payload = `omen:reading:${chatId}:${Date.now()}`;
+  const safeKind = kind === 'celtic' ? 'celtic' : 'reading';
+  const isCeltic = safeKind === 'celtic';
+  const payload = `omen:${safeKind}:${chatId}:${Date.now()}`;
   session.pendingPayment = {
     payload,
-    kind: 'reading',
+    kind: safeKind,
     readingQuestion: session.pendingReadingQuestion || session.reading.question,
-    stars: PAID_READING_STARS,
+    stars: isCeltic ? CELTIC_CROSS_STARS : PAID_READING_STARS,
     createdAt: Date.now()
   };
 
   if (currency === 'STARS') {
     await telegramSendInvoice(chatId, {
-      title: 'Продолжение расклада',
-      description: 'Новый расклад с Omen, голосовой интерпретацией и коротким продолжением разговора.',
-      stars: PAID_READING_STARS,
+      title: isCeltic ? 'Кельтский крест' : 'Продолжение расклада',
+      description: isCeltic
+        ? 'Кельтский крест: 10 карт, глубокая интерпретация и продолжение истории.'
+        : 'Новый расклад с Omen и коротким продолжением разговора.',
+      stars: session.pendingPayment.stars,
       payload
     });
     return;
   }
 
-  const paymentUrl = await lavaCreateInvoice(chatId, session, 'reading', currency, paymentMethod);
+  const paymentUrl = await lavaCreateInvoice(chatId, session, safeKind, currency, paymentMethod);
   await telegramSendPaymentUrl(
     chatId,
-    currency === 'USD'
-      ? 'Открыл оплату зарубежной картой. После успешной оплаты Omen автоматически продолжит историю.'
-      : paymentMethod === 'SBP'
-        ? 'Открыл оплату через СБП. После успешной оплаты Omen автоматически продолжит историю.'
-        : 'Открыл оплату банковской картой. После успешной оплаты Omen автоматически продолжит историю.',
+    isCeltic
+      ? currency === 'USD'
+        ? 'Открыл оплату Кельтского креста зарубежной картой. После успешной оплаты Omen автоматически продолжит историю.'
+        : paymentMethod === 'SBP'
+          ? 'Открыл оплату Кельтского креста через СБП. После успешной оплаты Omen автоматически продолжит историю.'
+          : 'Открыл оплату Кельтского креста банковской картой. После успешной оплаты Omen автоматически продолжит историю.'
+      : currency === 'USD'
+        ? 'Открыл оплату зарубежной картой. После успешной оплаты Omen автоматически продолжит историю.'
+        : paymentMethod === 'SBP'
+          ? 'Открыл оплату через СБП. После успешной оплаты Omen автоматически продолжит историю.'
+          : 'Открыл оплату банковской картой. После успешной оплаты Omen автоматически продолжит историю.',
     paymentUrl
   );
 }
@@ -1443,7 +1362,7 @@ async function createPaymentInvoice(chatId, session, kind, currency = 'RUB', pay
 function activatePaidPackage(session, kind = 'reading') {
   session.paidContinuation = true;
   session.paidPackageKind = kind;
-  session.paidReadingsRemaining = PAID_READINGS_PER_PACKAGE;
+  session.paidReadingsRemaining = kind === 'celtic' ? 0 : PAID_READINGS_PER_PACKAGE;
   session.paidConversationUsed = 0;
   session.freeConversationUsed = FREE_CONVERSATION_LIMIT;
   session.freeCooldownUsed = false;
@@ -1483,6 +1402,12 @@ async function handleSuccessfulPayment(message) {
   session.pendingLavaPayment = null;
   activatePaidPackage(session, pending.kind || 'reading');
 
+  if (pending.kind === 'celtic') {
+    await telegramSendMessage(chatId, 'Оплата прошла. Запускаю Кельтский крест — 10 карт и подробный разбор.');
+    await runPaidCelticReading(chatId, session, pending.readingQuestion || session.reading.question);
+    return true;
+  }
+
   await telegramSendMessage(chatId, 'Оплата прошла. В пакет входят два расклада: один сейчас и ещё один — в подарок. Начинаем первый.');
   await runPaidThreeCardReading(chatId, session, pending.readingQuestion || session.reading.question);
   return true;
@@ -1512,6 +1437,64 @@ async function handlePreCheckoutQuery(query) {
   await telegramAnswerPreCheckoutQuery(query.id, true);
 }
 
+async function runPaidCelticReading(chatId, session, question) {
+  const userName = session.userName || '';
+  const cards = drawCelticCrossCards();
+
+  try {
+    const mixingMessageIds = await telegramSendMessage(chatId, 'Мешаю карты...', true);
+    const shuffleMessageId = await telegramSendShuffleGif(chatId);
+    const interpretationPromise = generateInterpretation(question, cards, userName, 'celtic');
+    const spreadImage = await buildCelticCrossImage(cards);
+
+    await telegramSendSpreadImage(chatId, spreadImage);
+    for (const messageId of mixingMessageIds || []) await telegramDeleteMessage(chatId, messageId);
+    await telegramDeleteMessage(chatId, shuffleMessageId);
+
+    await telegramSendMessage(chatId, 'Вот какие карты выпали в Кельтском кресте и вот что я по ним вижу');
+    await sleep(1500);
+
+    const result = await interpretationPromise;
+    await telegramSendMessage(chatId, result.interpretation);
+
+    let followup = '';
+    try {
+      followup = await generateFollowupQuestion({
+        userName,
+        originalQuestion: question,
+        cards,
+        interpretation: result.interpretation
+      });
+      await telegramSendMessage(chatId, followup);
+    } catch (followupErr) {
+      console.error('[tarot-omen] Celtic follow-up question generation failed:', followupErr);
+    }
+
+    session.reading = {
+      question,
+      cards,
+      interpretation: result.interpretation,
+      spreadType: 'celtic'
+    };
+    session.history = Array.isArray(session.history) ? session.history.slice(-24) : [];
+    session.paidConversationUsed = 0;
+    session.paidReadingActive = true;
+    session.paidReadingsRemaining = 0;
+    session.paidPackageKind = 'celtic';
+    session.readingOfferShown = false;
+    session.pendingReadingQuestion = '';
+    session.lastPaidReadingAt = Date.now();
+    session.freeConversationUsed = FREE_CONVERSATION_LIMIT;
+    session.freeCooldownUsed = false;
+    session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
+    session.pendingPayment = null;
+    session.pendingLavaPayment = null;
+  } catch (err) {
+    console.error('[tarot-omen] Celtic reading error:', err);
+    await telegramSendMessage(chatId, 'Не удалось получить Кельтский крест. Оплата сохранена за этой историей — попробуй ещё раз.');
+  }
+}
+
 async function runPaidThreeCardReading(chatId, session, question) {
   const userName = session.userName || '';
   const cards = drawThreeCards();
@@ -1519,7 +1502,7 @@ async function runPaidThreeCardReading(chatId, session, question) {
   try {
     const mixingMessageIds = await telegramSendMessage(chatId, 'Мешаю карты...', true);
     const shuffleMessageId = await telegramSendShuffleGif(chatId);
-    const interpretationPromise = generateInterpretation(question, cards, userName);
+    const interpretationPromise = generateInterpretation(question, cards, userName, 'three');
     const spreadImagePromise = buildReadingImage(cards);
     const spreadImage = await spreadImagePromise;
 
@@ -1531,14 +1514,6 @@ async function runPaidThreeCardReading(chatId, session, question) {
     await sleep(1500);
 
     const result = await interpretationPromise;
-
-    // Paid readings include the voice. The user never pays separately for the voice.
-    try {
-      const voiceBuffer = await elevenLabsTextToSpeech(capVoiceText(result.voiceInterpretation));
-      if (voiceBuffer) await telegramSendVoice(chatId, voiceBuffer);
-    } catch (voiceErr) {
-      console.error('[tarot-omen] Paid reading voice generation failed; continuing with text:', voiceErr);
-    }
 
     await telegramSendMessage(chatId, result.interpretation);
 
@@ -1558,7 +1533,8 @@ async function runPaidThreeCardReading(chatId, session, question) {
     session.reading = {
       question,
       cards,
-      interpretation: result.interpretation
+      interpretation: result.interpretation,
+      spreadType: 'three'
     };
     // Keep the existing story history. A new paid spread continues the same
     // conversation instead of resetting Omen's context. Keep the buffer bounded.
@@ -1599,15 +1575,22 @@ async function handleTelegramUpdate(update) {
     try {
       if (callback.data === 'pay:stars:reading') {
         await createPaymentInvoice(chatId, session, 'reading', 'STARS');
+      } else if (callback.data === 'pay:stars:celtic') {
+        await createPaymentInvoice(chatId, session, 'celtic', 'STARS');
       } else if (callback.data === 'pay:lava:reading:RUB:CARD') {
         await createPaymentInvoice(chatId, session, 'reading', 'RUB', 'CARD');
       } else if (callback.data === 'pay:lava:reading:RUB:SBP') {
         await createPaymentInvoice(chatId, session, 'reading', 'RUB', 'SBP');
+      } else if (callback.data === 'pay:lava:celtic:RUB:CARD') {
+        await createPaymentInvoice(chatId, session, 'celtic', 'RUB', 'CARD');
+      } else if (callback.data === 'pay:lava:celtic:RUB:SBP') {
+        await createPaymentInvoice(chatId, session, 'celtic', 'RUB', 'SBP');
       } else if (callback.data === 'pay:lava:reading:RUB') {
-        // Backward compatibility for an older combined RUB button.
         await createPaymentInvoice(chatId, session, 'reading', 'RUB', 'CARD');
       } else if (callback.data === 'pay:lava:reading:USD') {
         await createPaymentInvoice(chatId, session, 'reading', 'USD');
+      } else if (callback.data === 'pay:lava:celtic:USD') {
+        await createPaymentInvoice(chatId, session, 'celtic', 'USD');
       } else if (callback.data === 'gift:reading') {
         if (session?.pendingGiftReading && session?.paidReadingsRemaining > 0) {
           session.pendingGiftReading = false;
@@ -1733,7 +1716,7 @@ async function handleTelegramUpdate(update) {
       await telegramSendMessage(chatId, 'Мешаю карты...', true);
       await telegramSendShuffleGif(chatId);
 
-      const interpretationPromise = generateInterpretation(continuationQuestion, cards, userName);
+      const interpretationPromise = generateInterpretation(continuationQuestion, cards, userName, 'three');
       const spreadImage = await buildReadingImage(cards);
       await telegramSendSpreadImage(chatId, spreadImage);
       await telegramSendMessage(chatId, CARDS_CAPTION);
@@ -1759,7 +1742,8 @@ async function handleTelegramUpdate(update) {
       session.reading = {
         question: continuationQuestion,
         cards,
-        interpretation: result.interpretation
+        interpretation: result.interpretation,
+        spreadType: 'three'
       };
       session.history = Array.isArray(session.history) ? session.history.slice(-24) : [];
       session.freeConversationUsed = 0;
@@ -1806,7 +1790,8 @@ async function handleTelegramUpdate(update) {
         history: session.history,
         latestMessage: text,
         conversationUsed: session.paidConversationUsed,
-        conversationLimit: PAID_CONVERSATION_LIMIT
+        conversationLimit: PAID_CONVERSATION_LIMIT,
+        spreadType: session.reading.spreadType || 'three'
       });
 
       session.paidConversationUsed += 1;
@@ -1855,7 +1840,8 @@ async function handleTelegramUpdate(update) {
         history: session.history,
         latestMessage: text,
         conversationUsed: session.freeConversationUsed,
-        conversationLimit: FREE_CONVERSATION_LIMIT
+        conversationLimit: FREE_CONVERSATION_LIMIT,
+        spreadType: session.reading.spreadType || 'three'
       });
 
       session.freeConversationUsed += 1;
@@ -1907,18 +1893,6 @@ async function handleTelegramUpdate(update) {
 
     const result = await interpretationPromise;
 
-    // The very first free reading includes voice. Every later paid reading also
-    // includes voice; the user never pays separately for the audio.
-    const includeVoice = !session?.freeReadingUsed;
-    if (includeVoice) {
-      try {
-        const voiceBuffer = await elevenLabsTextToSpeech(capVoiceText(result.voiceInterpretation));
-        if (voiceBuffer) await telegramSendVoice(chatId, voiceBuffer);
-      } catch (voiceErr) {
-        console.error('[tarot-omen] Reading voice generation failed; continuing with text:', voiceErr);
-      }
-    }
-
     await telegramSendMessage(chatId, result.interpretation);
 
     // Every completed spread gets a separate, context-aware question that invites
@@ -1940,7 +1914,8 @@ async function handleTelegramUpdate(update) {
       reading: {
         question: text,
         cards,
-        interpretation: result.interpretation
+        interpretation: result.interpretation,
+        spreadType: 'three'
       },
       history: [],
       freeConversationUsed: 0,
