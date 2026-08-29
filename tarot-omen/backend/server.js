@@ -1043,7 +1043,8 @@ async function offerPaidContinuation(chatId, session, readingQuestion = '') {
     'Если хочешь продолжить эту историю сейчас, можно открыть следующий расклад. После оплаты ты получишь два расклада: один сейчас и ещё один — в подарок. Если не спешишь, можно подождать 72 часа — после этого снова будет доступен бесплатный расклад, и мы продолжим эту же историю.',
     [
       [{ text: `⭐ Telegram Stars — ${PAID_READING_STARS}`, callback_data: 'pay:stars:reading' }],
-      [{ text: `💳 Карта / СБП — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB' }],
+      [{ text: `💳 Карта — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB:CARD' }],
+      [{ text: `🏦 СБП — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB:SBP' }],
       [{ text: `🌍 Зарубежная карта — $${LAVA_READING_USD}`, callback_data: 'pay:lava:reading:USD' }]
     ]
   );
@@ -1166,7 +1167,7 @@ async function resolveLavaOfferId(kind) {
   return resolved;
 }
 
-async function lavaCreateInvoice(chatId, session, kind, currency) {
+async function lavaCreateInvoice(chatId, session, kind, currency, paymentMethod = '') {
   if (!LAVA_API_KEY) {
     throw new Error('LAVA_API_KEY is not configured.');
   }
@@ -1185,6 +1186,13 @@ async function lavaCreateInvoice(chatId, session, kind, currency) {
     currency: normalizedCurrency,
     amount
   };
+
+  // Lava API: for RUB, PAY2ME supports explicit CARD or SBP payment methods.
+  // For USD we keep the existing provider/default behavior unchanged.
+  if (normalizedCurrency === 'RUB' && (paymentMethod === 'CARD' || paymentMethod === 'SBP')) {
+    payload.paymentProvider = 'PAY2ME';
+    payload.paymentMethod = paymentMethod;
+  }
 
   const createInvoice = async (currentOfferId) => {
     const response = await fetch(`${LAVA_API_URL}/api/v3/invoice`, {
@@ -1275,6 +1283,8 @@ async function lavaCreateInvoice(chatId, session, kind, currency) {
     currency: normalizedCurrency,
     amount,
     offerId,
+    paymentMethod: normalizedCurrency === 'RUB' ? (paymentMethod || 'CARD') : '',
+    paymentProvider: normalizedCurrency === 'RUB' ? 'PAY2ME' : '',
     email,
     createdAt: Date.now()
   };
@@ -1376,7 +1386,7 @@ async function handleLavaWebhook(body) {
   await runPaidThreeCardReading(chatId, session, question);
 }
 
-async function createPaymentInvoice(chatId, session, kind, currency = 'RUB') {
+async function createPaymentInvoice(chatId, session, kind, currency = 'RUB', paymentMethod = '') {
   if (!session?.reading) {
     await telegramSendMessage(chatId, 'Сначала нужен расклад, с которого начнём эту историю.');
     return;
@@ -1409,12 +1419,14 @@ async function createPaymentInvoice(chatId, session, kind, currency = 'RUB') {
     return;
   }
 
-  const paymentUrl = await lavaCreateInvoice(chatId, session, 'reading', currency);
+  const paymentUrl = await lavaCreateInvoice(chatId, session, 'reading', currency, paymentMethod);
   await telegramSendPaymentUrl(
     chatId,
     currency === 'USD'
       ? 'Открыл оплату зарубежной картой. После успешной оплаты Omen автоматически продолжит историю.'
-      : 'Открыл оплату картой или через СБП. После успешной оплаты Omen автоматически продолжит историю.',
+      : paymentMethod === 'SBP'
+        ? 'Открыл оплату через СБП. После успешной оплаты Omen автоматически продолжит историю.'
+        : 'Открыл оплату банковской картой. После успешной оплаты Omen автоматически продолжит историю.',
     paymentUrl
   );
 }
@@ -1578,8 +1590,13 @@ async function handleTelegramUpdate(update) {
     try {
       if (callback.data === 'pay:stars:reading') {
         await createPaymentInvoice(chatId, session, 'reading', 'STARS');
+      } else if (callback.data === 'pay:lava:reading:RUB:CARD') {
+        await createPaymentInvoice(chatId, session, 'reading', 'RUB', 'CARD');
+      } else if (callback.data === 'pay:lava:reading:RUB:SBP') {
+        await createPaymentInvoice(chatId, session, 'reading', 'RUB', 'SBP');
       } else if (callback.data === 'pay:lava:reading:RUB') {
-        await createPaymentInvoice(chatId, session, 'reading', 'RUB');
+        // Backward compatibility for an old button already present in a chat.
+        await createPaymentInvoice(chatId, session, 'reading', 'RUB', 'CARD');
       } else if (callback.data === 'pay:lava:reading:USD') {
         await createPaymentInvoice(chatId, session, 'reading', 'USD');
       } else if (callback.data === 'gift:reading') {
