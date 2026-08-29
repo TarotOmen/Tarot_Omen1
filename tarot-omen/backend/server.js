@@ -14,6 +14,14 @@ const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const OMEN_VOICE_ID = process.env.OMEN_VOICE_ID;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+
+// LAVA.TOP card / bank payment integration. No npm package is required.
+const LAVA_API_KEY = process.env.LAVA_API_KEY;
+const LAVA_WEBHOOK_API_KEY = process.env.LAVA_WEBHOOK_API_KEY;
+const LAVA_API_URL = process.env.LAVA_API_URL || 'https://gate.lava.top';
+const LAVA_READING_OFFER_ID = process.env.LAVA_READING_OFFER_ID;
+const LAVA_CELTIC_OFFER_ID = process.env.LAVA_CELTIC_OFFER_ID;
+const LAVA_EMAIL_DOMAIN = process.env.LAVA_EMAIL_DOMAIN || 'omenbot.app';
 const TELEGRAM_WEBHOOK_URL =
   process.env.TELEGRAM_WEBHOOK_URL || 'https://tarot-omen1.onrender.com/telegram-webhook';
 
@@ -28,6 +36,15 @@ if (!ELEVENLABS_API_KEY) {
 }
 if (!OMEN_VOICE_ID) {
   console.warn('[tarot-omen] WARNING: OMEN_VOICE_ID is not set. Voice messages will be skipped.');
+}
+if (!LAVA_API_KEY) {
+  console.warn('[tarot-omen] WARNING: LAVA_API_KEY is not set. Card payments will be unavailable.');
+}
+if (!LAVA_WEBHOOK_API_KEY) {
+  console.warn('[tarot-omen] WARNING: LAVA_WEBHOOK_API_KEY is not set. LAVA payment webhooks will be rejected.');
+}
+if (!LAVA_READING_OFFER_ID) {
+  console.warn('[tarot-omen] WARNING: LAVA_READING_OFFER_ID is not set. Card payment links cannot be created.');
 }
 
 const app = express();
@@ -585,10 +602,30 @@ async function buildReadingImage(cards) {
 // ===== CONVERSATION SESSIONS =====
 // MVP storage: in-memory. A Render restart clears sessions.
 const sessions = new Map();
+const PAID_READING_STARS = Number(process.env.PAID_READING_STARS || 49);
+const CELTIC_CROSS_STARS = Number(process.env.CELTIC_CROSS_STARS || 89);
+
+// LAVA.TOP has a minimum one-time price of 50 RUB / 5 USD / 5 EUR.
+// Therefore the card price is 50 RUB (while Telegram Stars can remain 49).
+const LAVA_READING_RUB = Number(process.env.LAVA_READING_RUB || 50);
+const LAVA_READING_USD = Number(process.env.LAVA_READING_USD || 5);
+const LAVA_CELTIC_RUB = Number(process.env.LAVA_CELTIC_RUB || 90);
+const LAVA_CELTIC_USD = Number(process.env.LAVA_CELTIC_USD || 9);
+
 const FREE_CONVERSATION_LIMIT = 3;
-// Free conversation is text-only. ElevenLabs is used for the first reading
-// and later only for readings after payment is connected.
+const PAID_CONVERSATION_LIMIT = 3;
+const PAID_READINGS_PER_PACKAGE = 2;
+const FREE_COOLDOWN_MS = 3 * 24 * 60 * 60 * 1000;
 const PAID_CONTINUATION_DEFAULT = false;
+const processedPaymentCharges = new Set();
+const processedLavaPayments = new Set();
+
+if (!Number.isInteger(PAID_READING_STARS) || PAID_READING_STARS < 1) {
+  throw new Error('PAID_READING_STARS must be a positive integer.');
+}
+if (!Number.isInteger(CELTIC_CROSS_STARS) || CELTIC_CROSS_STARS < 1) {
+  throw new Error('CELTIC_CROSS_STARS must be a positive integer.');
+}
 
 const CONVERSATION_SYSTEM_PROMPT = `You are Omen, the same Tarot reader who has just completed a three-card reading.
 You are now having a short, personal conversation about that reading.
@@ -600,11 +637,11 @@ Rules:
 - Never invent facts about the user's life.
 - Never claim certainty about the future.
 - Never assume or mention gender. Use the Telegram first name only when it sounds natural.
-- If the user reveals a genuinely new layer that would benefit from another spread, you may gently invite them to look at that specific issue with a separate spread. Never mention payment, credits, limits or sales.
+- If the user reveals a genuinely new layer that would benefit from another spread, set reading_offer to true and formulate one specific reading_question for that new layer. Do not mention payment, credits, limits or sales inside reply or next_message.
 - If there is no genuinely new question, continue the conversation naturally.
 - Do not force a reading offer merely because a message limit exists.
-- Return ONLY valid JSON with exactly these three fields:
-{"reply":"...","next_message":"...","next_message_type":"question"}
+- Return ONLY valid JSON with exactly these five fields:
+{"reply":"...","next_message":"...","next_message_type":"question","reading_offer":false,"reading_question":""}
 
 Rules for next_message:
 - After EVERY reply, provide either a short context-specific question OR a short concluding thought. Never leave the reply hanging without one of these.
@@ -681,11 +718,19 @@ async function generateConversationResponse({ userName, originalQuestion, cards,
         500
       );
       const nextMessageType = result?.next_message_type === 'conclusion' ? 'conclusion' : 'question';
+      const readingOffer = result?.reading_offer === true;
+      const readingQuestion = capText(
+        typeof result?.reading_question === 'string' ? result.reading_question.trim() : '',
+        500
+      );
 
       if (!reply) throw new Error('Gemini returned an empty conversation reply.');
       if (!nextMessage) throw new Error('Gemini returned no next conversation message.');
+      if (readingOffer && !readingQuestion) {
+        throw new Error('Gemini marked a reading offer without a reading question.');
+      }
 
-      return { reply, nextMessage, nextMessageType };
+      return { reply, nextMessage, nextMessageType, readingOffer, readingQuestion };
     } catch (err) {
       lastError = err?.name === 'AbortError'
         ? new Error('Gemini conversation request timed out after 60 seconds.')
@@ -911,9 +956,586 @@ async function telegramSendVoice(chatId, audioBuffer) {
   }
 }
 
+async function telegramAnswerPreCheckoutQuery(queryId, ok, errorMessage = '') {
+  const body = {
+    pre_checkout_query_id: queryId,
+    ok
+  };
+  if (!ok && errorMessage) body.error_message = errorMessage;
+
+  const response = await fetch(`${TELEGRAM_API}/answerPreCheckoutQuery`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Telegram answerPreCheckoutQuery failed: ${await response.text()}`);
+  }
+}
+
+async function telegramSendInvoice(chatId, { title, description, stars, payload }) {
+  const response = await fetch(`${TELEGRAM_API}/sendInvoice`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      title,
+      description,
+      payload,
+      currency: 'XTR',
+      prices: [{ label: title, amount: stars }],
+      start_parameter: `omen_${payload.slice(-24)}`
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Telegram sendInvoice failed: ${await response.text()}`);
+  }
+
+  const data = await response.json();
+  if (!data.ok) throw new Error(data.description || 'Telegram sendInvoice failed.');
+  return data.result;
+}
+
+async function telegramSendInlineKeyboard(chatId, text, buttons) {
+  const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      reply_markup: { inline_keyboard: buttons }
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Telegram sendMessage with keyboard failed: ${await response.text()}`);
+  }
+}
+
+async function offerPaidContinuation(chatId, session, readingQuestion = '') {
+  const question = (readingQuestion || '').trim() ||
+    'Посмотреть следующий слой этой истории отдельным раскладом';
+
+  session.pendingReadingQuestion = question;
+  session.readingOfferShown = true;
+  session.pendingGiftReading = false;
+
+  await telegramSendInlineKeyboard(
+    chatId,
+    'Если хочешь продолжить эту историю сейчас, можно открыть следующий расклад. После оплаты ты получишь два расклада: один сейчас и ещё один — в подарок. Если не хочешь оплачивать сейчас, можно подождать 72 часа — после этого я снова смогу сделать для тебя бесплатный расклад и продолжить нашу историю уже с его помощью.',
+    [
+      [{ text: `⭐ Telegram Stars — ${PAID_READING_STARS}`, callback_data: 'pay:stars:reading' }],
+      [{ text: `💳 Карта / СБП — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB' }],
+      [{ text: `🌍 Зарубежная карта — $${LAVA_READING_USD}`, callback_data: 'pay:lava:reading:USD' }]
+    ]
+  );
+}
+
+async function offerGiftReading(chatId, session) {
+  session.pendingGiftReading = true;
+  session.readingOfferShown = false;
+
+  await telegramSendInlineKeyboard(
+    chatId,
+    'В этом продолжении у тебя остался ещё один расклад в подарок. Можем использовать его сейчас или оставить на потом — он никуда не исчезнет.',
+    [[{ text: '🔮 Использовать подарок', callback_data: 'gift:reading' }]]
+  );
+}
+
+function lavaSyntheticEmail(chatId, kind) {
+  const safeKind = kind === 'celtic' ? 'celtic' : 'reading';
+  return `omen-${chatId}-${safeKind}@${LAVA_EMAIL_DOMAIN}`;
+}
+
+function extractChatIdFromLavaEmail(email) {
+  const value = String(email || '').trim();
+  const match = value.match(/^omen-(\d+)-(reading|celtic)@/i);
+  return match ? Number(match[1]) : null;
+}
+
+function extractKindFromLavaEmail(email) {
+  const value = String(email || '').trim();
+  const match = value.match(/^omen-(\d+)-(reading|celtic)@/i);
+  return match ? match[2].toLowerCase() : null;
+}
+
+function findFirstDeepValue(value, keys, depth = 0) {
+  if (depth > 5 || value == null || typeof value !== 'object') return undefined;
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(value, key) && value[key] != null) {
+      return value[key];
+    }
+  }
+  for (const child of Object.values(value)) {
+    const found = findFirstDeepValue(child, keys, depth + 1);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
+async function lavaCreateInvoice(chatId, session, kind, currency) {
+  if (!LAVA_API_KEY) {
+    throw new Error('LAVA_API_KEY is not configured.');
+  }
+
+  const offerId = kind === 'celtic' ? LAVA_CELTIC_OFFER_ID : LAVA_READING_OFFER_ID;
+  if (!offerId) {
+    throw new Error(`LAVA_${kind === 'celtic' ? 'CELTIC' : 'READING'}_OFFER_ID is not configured.`);
+  }
+
+  const normalizedCurrency = currency === 'USD' ? 'USD' : 'RUB';
+  const amount = kind === 'celtic'
+    ? (normalizedCurrency === 'USD' ? LAVA_CELTIC_USD : LAVA_CELTIC_RUB)
+    : (normalizedCurrency === 'USD' ? LAVA_READING_USD : LAVA_READING_RUB);
+
+  const email = lavaSyntheticEmail(chatId, kind);
+  const payload = {
+    email,
+    offerId,
+    currency: normalizedCurrency,
+    amount
+  };
+
+  const response = await fetch(`${LAVA_API_URL}/api/v3/invoice`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'X-Api-Key': LAVA_API_KEY
+    },
+    body: JSON.stringify(payload)
+  });
+
+  const raw = await response.text();
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error(`LAVA returned invalid JSON (HTTP ${response.status}).`);
+  }
+
+  if (!response.ok) {
+    console.error('[tarot-omen] LAVA invoice error:', data);
+    throw new Error(data?.message || data?.error?.message || `LAVA API HTTP ${response.status}`);
+  }
+
+  const paymentUrl =
+    data?.paymentUrl ||
+    data?.payment_url ||
+    data?.invoiceUrl ||
+    data?.invoice_url ||
+    data?.url ||
+    data?.result?.paymentUrl ||
+    data?.result?.payment_url ||
+    data?.result?.url;
+
+  if (!paymentUrl) {
+    console.error('[tarot-omen] LAVA invoice response without payment URL:', data);
+    throw new Error('LAVA invoice was created but payment URL was not returned.');
+  }
+
+  session.pendingLavaPayment = {
+    kind,
+    currency: normalizedCurrency,
+    amount,
+    offerId,
+    email,
+    createdAt: Date.now()
+  };
+
+  return paymentUrl;
+}
+
+async function telegramSendPaymentUrl(chatId, text, url) {
+  const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      text,
+      reply_markup: {
+        inline_keyboard: [[{ text: '💳 Перейти к оплате', url }]]
+      }
+    })
+  });
+  if (!response.ok) {
+    throw new Error(`Telegram payment URL message failed: ${await response.text()}`);
+  }
+}
+
+async function handleLavaWebhook(body) {
+  const event = String(
+    findFirstDeepValue(body, ['event', 'eventType', 'type']) || ''
+  ).toLowerCase();
+  const status = String(
+    findFirstDeepValue(body, ['status', 'contractStatus']) || ''
+  ).toLowerCase();
+
+  const isSuccess =
+    event === 'payment.success' ||
+    event === 'payment_success' ||
+    event === 'success' ||
+    status === 'success';
+
+  if (!isSuccess) return;
+
+  const email = findFirstDeepValue(body, ['email', 'buyerEmail', 'customerEmail']);
+  const chatId = extractChatIdFromLavaEmail(email);
+  const kindFromEmail = extractKindFromLavaEmail(email);
+  if (!chatId || !kindFromEmail) {
+    console.warn('[tarot-omen] LAVA payment received but chat ID could not be extracted:', body);
+    return;
+  }
+
+  const invoiceId = String(
+    findFirstDeepValue(body, ['invoiceId', 'invoiceID', 'id', 'contractId']) ||
+    `${email}:${findFirstDeepValue(body, ['amount']) || ''}:${findFirstDeepValue(body, ['createdAt']) || ''}`
+  );
+  if (processedLavaPayments.has(invoiceId)) return;
+  processedLavaPayments.add(invoiceId);
+
+  let session = sessions.get(chatId);
+  if (!session) {
+    session = {
+      userName: '',
+      reading: null,
+      history: [],
+      freeConversationUsed: FREE_CONVERSATION_LIMIT,
+      paidConversationUsed: 0,
+      paidReadingsRemaining: 0,
+      paidReadingActive: false,
+      paidPackageKind: 'reading',
+      pendingGiftReading: false,
+      paidContinuation: false,
+      readingOfferShown: false,
+      pendingReadingQuestion: '',
+      pendingPayment: null,
+      pendingLavaPayment: null,
+      freeReadingUsed: true,
+      freeCooldownAvailableAt: Date.now()
+    };
+    sessions.set(chatId, session);
+  }
+
+  const pending = session.pendingLavaPayment;
+  if (pending && pending.kind !== kindFromEmail) {
+    console.warn('[tarot-omen] LAVA payment kind mismatch. Ignoring webhook.');
+    return;
+  }
+
+  const question = session.pendingReadingQuestion || session.reading?.question ||
+    'Посмотреть следующий слой этой истории';
+
+  session.pendingLavaPayment = null;
+  activatePaidPackage(session, kindFromEmail);
+
+  await telegramSendMessage(chatId, 'Оплата прошла. В пакет входят два расклада: один сейчас и ещё один — в подарок. Начинаем первый.');
+
+  if (kindFromEmail === 'celtic') {
+    // Celtic Cross is intentionally not executed until its 10-card visual flow is installed.
+    await telegramSendMessage(chatId, 'Кельтский крест уже оплачен. Визуализацию этого расклада подключим следующим этапом. Второй расклад останется доступен в подарок.');
+    return;
+  }
+
+  await runPaidThreeCardReading(chatId, session, question);
+}
+
+async function createPaymentInvoice(chatId, session, kind, currency = 'RUB') {
+  if (!session?.reading) {
+    await telegramSendMessage(chatId, 'Сначала нужен расклад, с которого начнём эту историю.');
+    return;
+  }
+
+  if (kind === 'celtic') {
+    await telegramSendMessage(
+      chatId,
+      'Кельтский крест будет отдельным платным форматом. Его оплату подключим вместе с готовой визуализацией.'
+    );
+    return;
+  }
+
+  const payload = `omen:reading:${chatId}:${Date.now()}`;
+  session.pendingPayment = {
+    payload,
+    kind: 'reading',
+    readingQuestion: session.pendingReadingQuestion || session.reading.question,
+    stars: PAID_READING_STARS,
+    createdAt: Date.now()
+  };
+
+  if (currency === 'STARS') {
+    await telegramSendInvoice(chatId, {
+      title: 'Продолжение расклада',
+      description: 'Новый расклад с Omen, голосовой интерпретацией и коротким продолжением разговора.',
+      stars: PAID_READING_STARS,
+      payload
+    });
+    return;
+  }
+
+  const paymentUrl = await lavaCreateInvoice(chatId, session, 'reading', currency);
+  await telegramSendPaymentUrl(
+    chatId,
+    currency === 'USD'
+      ? 'Открыл оплату зарубежной картой. После успешной оплаты Omen автоматически продолжит историю.'
+      : 'Открыл оплату картой или через СБП. После успешной оплаты Omen автоматически продолжит историю.',
+    paymentUrl
+  );
+}
+
+function activatePaidPackage(session, kind = 'reading') {
+  session.paidContinuation = true;
+  session.paidPackageKind = kind;
+  session.paidReadingsRemaining = PAID_READINGS_PER_PACKAGE;
+  session.paidConversationUsed = 0;
+  session.freeConversationUsed = FREE_CONVERSATION_LIMIT;
+  session.freeCooldownUsed = false;
+  session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
+  session.readingOfferShown = false;
+  session.pendingGiftReading = false;
+}
+
+async function handleSuccessfulPayment(message) {
+  const payment = message?.successful_payment;
+  if (!payment) return false;
+
+  const chatId = message.chat.id;
+  const payload = String(payment.invoice_payload || '');
+  const chargeId = String(payment.telegram_payment_charge_id || '');
+  const session = sessions.get(chatId);
+
+  if (!session?.pendingPayment || session.pendingPayment.payload !== payload) {
+    await telegramSendMessage(chatId, 'Платёж получен, но я не смог сопоставить его с текущей историей. Напиши мне, и я помогу продолжить.');
+    return true;
+  }
+
+  if (
+    payment.currency !== 'XTR' ||
+    payment.total_amount !== session.pendingPayment.stars
+  ) {
+    console.error('[tarot-omen] Successful payment amount/currency mismatch:', payment);
+    await telegramSendMessage(chatId, 'Платёж получен, но его параметры не совпали с ожидаемым заказом. Напиши мне, и я проверю оплату.');
+    return true;
+  }
+
+  if (chargeId && processedPaymentCharges.has(chargeId)) return true;
+  if (chargeId) processedPaymentCharges.add(chargeId);
+
+  const pending = session.pendingPayment;
+  session.pendingPayment = null;
+  session.pendingLavaPayment = null;
+  activatePaidPackage(session, pending.kind || 'reading');
+
+  await telegramSendMessage(chatId, 'Оплата прошла. В пакет входят два расклада: один сейчас и ещё один — в подарок. Начинаем первый.');
+  await runPaidThreeCardReading(chatId, session, pending.readingQuestion || session.reading.question);
+  return true;
+}
+
+async function handlePreCheckoutQuery(query) {
+  const payload = String(query?.invoice_payload || '');
+  const chatId = query?.from?.id;
+  const session = sessions.get(chatId);
+  const pending = session?.pendingPayment;
+
+  const valid =
+    query?.currency === 'XTR' &&
+    !!pending &&
+    pending.payload === payload &&
+    query.total_amount === pending.stars;
+
+  if (!valid) {
+    await telegramAnswerPreCheckoutQuery(
+      query.id,
+      false,
+      'Не удалось подтвердить этот платёж. Попробуй открыть оплату ещё раз.'
+    );
+    return;
+  }
+
+  await telegramAnswerPreCheckoutQuery(query.id, true);
+}
+
+async function runFreeCooldownThreeCardReading(chatId, session, question) {
+  const userName = session.userName || '';
+  const cards = drawThreeCards();
+
+  try {
+    const mixingMessageIds = await telegramSendMessage(chatId, 'Мешаю карты...', true);
+    const shuffleMessageId = await telegramSendShuffleGif(chatId);
+    const interpretationPromise = generateInterpretation(question, cards, userName);
+    const spreadImagePromise = buildReadingImage(cards);
+    const spreadImage = await spreadImagePromise;
+
+    await telegramSendSpreadImage(chatId, spreadImage);
+    for (const messageId of mixingMessageIds || []) await telegramDeleteMessage(chatId, messageId);
+    await telegramDeleteMessage(chatId, shuffleMessageId);
+
+    await telegramSendMessage(chatId, CARDS_CAPTION);
+    await sleep(1500);
+
+    const result = await interpretationPromise;
+    await telegramSendMessage(chatId, result.interpretation);
+
+    let followup = '';
+    try {
+      followup = await generateFollowupQuestion({
+        userName,
+        originalQuestion: question,
+        cards,
+        interpretation: result.interpretation
+      });
+      await telegramSendMessage(chatId, followup);
+    } catch (followupErr) {
+      console.error('[tarot-omen] Free cooldown follow-up question generation failed:', followupErr);
+    }
+
+    session.reading = {
+      question,
+      cards,
+      interpretation: result.interpretation
+    };
+    session.history = [];
+    session.freeConversationUsed = 0;
+    session.paidConversationUsed = 0;
+    session.paidReadingActive = false;
+    session.readingOfferShown = false;
+    session.pendingReadingQuestion = '';
+    session.freeCooldownUsed = false;
+    session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
+    session.lastFreeCooldownReadingAt = Date.now();
+  } catch (err) {
+    console.error('[tarot-omen] Free cooldown reading error:', err);
+    throw err;
+  }
+}
+
+async function runPaidThreeCardReading(chatId, session, question) {
+  const userName = session.userName || '';
+  const cards = drawThreeCards();
+
+  try {
+    const mixingMessageIds = await telegramSendMessage(chatId, 'Мешаю карты...', true);
+    const shuffleMessageId = await telegramSendShuffleGif(chatId);
+    const interpretationPromise = generateInterpretation(question, cards, userName);
+    const spreadImagePromise = buildReadingImage(cards);
+    const spreadImage = await spreadImagePromise;
+
+    await telegramSendSpreadImage(chatId, spreadImage);
+    for (const messageId of mixingMessageIds || []) await telegramDeleteMessage(chatId, messageId);
+    await telegramDeleteMessage(chatId, shuffleMessageId);
+
+    await telegramSendMessage(chatId, CARDS_CAPTION);
+    await sleep(1500);
+
+    const result = await interpretationPromise;
+
+    // Paid readings include the voice. The user never pays separately for the voice.
+    try {
+      const voiceBuffer = await elevenLabsTextToSpeech(result.voiceInterpretation);
+      if (voiceBuffer) await telegramSendVoice(chatId, voiceBuffer);
+    } catch (voiceErr) {
+      console.error('[tarot-omen] Paid reading voice generation failed; continuing with text:', voiceErr);
+    }
+
+    await telegramSendMessage(chatId, result.interpretation);
+
+    let followup = '';
+    try {
+      followup = await generateFollowupQuestion({
+        userName,
+        originalQuestion: question,
+        cards,
+        interpretation: result.interpretation
+      });
+      await telegramSendMessage(chatId, followup);
+    } catch (followupErr) {
+      console.error('[tarot-omen] Paid follow-up question generation failed:', followupErr);
+    }
+
+    session.reading = {
+      question,
+      cards,
+      interpretation: result.interpretation
+    };
+    session.history = [];
+    session.paidConversationUsed = 0;
+    session.paidReadingsRemaining = Math.max(0, Number(session.paidReadingsRemaining || 0) - 1);
+    session.paidReadingActive = true;
+    session.readingOfferShown = false;
+    session.pendingReadingQuestion = '';
+    session.lastPaidReadingAt = Date.now();
+    session.freeCooldownUsed = false;
+    session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
+  } catch (err) {
+    console.error('[tarot-omen] Paid reading error:', err);
+    await telegramSendMessage(chatId, 'Не удалось получить этот расклад. Оплата сохранена за этой историей — попробуй ещё раз.');
+  }
+}
+
 async function handleTelegramUpdate(update) {
+  if (update?.pre_checkout_query) {
+    try {
+      await handlePreCheckoutQuery(update.pre_checkout_query);
+    } catch (err) {
+      console.error('[tarot-omen] Pre-checkout handling failed:', err);
+      try {
+        await telegramAnswerPreCheckoutQuery(update.pre_checkout_query.id, false, 'Не удалось подтвердить платёж.');
+      } catch (answerErr) {
+        console.error('[tarot-omen] Failed to answer pre-checkout query:', answerErr);
+      }
+    }
+    return;
+  }
+
+  const callback = update?.callback_query;
+  if (callback) {
+    const chatId = callback.message?.chat?.id;
+    const session = sessions.get(chatId);
+    try {
+      if (callback.data === 'pay:stars:reading') {
+        await createPaymentInvoice(chatId, session, 'reading', 'STARS');
+      } else if (callback.data === 'pay:lava:reading:RUB') {
+        await createPaymentInvoice(chatId, session, 'reading', 'RUB');
+      } else if (callback.data === 'pay:lava:reading:USD') {
+        await createPaymentInvoice(chatId, session, 'reading', 'USD');
+      } else if (callback.data === 'gift:reading') {
+        if (session?.pendingGiftReading && session?.paidReadingsRemaining > 0) {
+          session.pendingGiftReading = false;
+          session.pendingReadingQuestion = '';
+          await telegramSendMessage(chatId, 'Тогда используем твой подарок. Посмотрим следующий слой этой истории.');
+          await runPaidThreeCardReading(chatId, session, session.reading?.question || 'Посмотреть следующий слой этой истории');
+        }
+      } else if (callback.data === 'pay:reading' || callback.data === 'pay:celtic') {
+        const kind = callback.data === 'pay:celtic' ? 'celtic' : 'reading';
+        await createPaymentInvoice(chatId, session, kind, 'STARS');
+      }
+    } catch (err) {
+      console.error('[tarot-omen] Payment button handling failed:', err);
+      if (chatId) await telegramSendMessage(chatId, 'Не удалось открыть оплату. Попробуй ещё раз.');
+    } finally {
+      await fetch(`${TELEGRAM_API}/answerCallbackQuery`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ callback_query_id: callback.id })
+      }).catch(() => {});
+    }
+    return;
+  }
+
   const message = update?.message;
   if (!message) return;
+
+  if (message.successful_payment) {
+    try {
+      await handleSuccessfulPayment(message);
+    } catch (err) {
+      console.error('[tarot-omen] Successful payment handling failed:', err);
+      await telegramSendMessage(message.chat.id, 'Платёж прошёл, но возникла техническая ошибка при запуске расклада. Напиши ещё раз, чтобы продолжить.');
+    }
+    return;
+  }
 
   // Text input only. Voice-to-text is intentionally not enabled because it would
   // require a separate speech-to-text service and consume paid API resources.
@@ -926,7 +1548,30 @@ async function handleTelegramUpdate(update) {
   if (!text) return;
 
   if (text === '/start') {
-    sessions.delete(chatId);
+    // /start must never reset the user's free entitlement. It only starts/returns
+    // to the current Omen session.
+    if (!sessions.has(chatId)) {
+      sessions.set(chatId, {
+        userName,
+        reading: null,
+        history: [],
+        freeConversationUsed: 0,
+        paidConversationUsed: 0,
+        paidReadingsRemaining: 0,
+        paidReadingActive: false,
+        paidPackageKind: 'reading',
+        pendingGiftReading: false,
+        paidContinuation: false,
+        readingOfferShown: false,
+        pendingReadingQuestion: '',
+        pendingPayment: null,
+        pendingLavaPayment: null,
+        freeReadingUsed: false,
+        freeCooldownAvailableAt: 0
+      });
+    } else {
+      sessions.get(chatId).userName = userName || sessions.get(chatId).userName || '';
+    }
     await telegramSendMessage(chatId, 'Задавай свой вопрос');
     return;
   }
@@ -937,6 +1582,98 @@ async function handleTelegramUpdate(update) {
   }
 
   const session = sessions.get(chatId);
+
+  // If Omen has already offered a specific next spread and the user confirms
+  // in plain text (for example, "Хочу", "Давай", "Да"), go straight to
+  // the payment invoice instead of spending another Gemini request on chat.
+  const affirmative = /^(да|давай|хочу|конечно|погнали|согласен|согласна|сделаем|смотреть|посмотрим|давай посмотрим|хочу посмотреть|использовать|используем|бери подарок|давай подарок|yes|sure|ok|okay)$/i.test(text);
+  if (session?.pendingGiftReading && session?.paidReadingsRemaining > 0 && affirmative) {
+    session.pendingGiftReading = false;
+    session.pendingReadingQuestion = '';
+    await telegramSendMessage(chatId, 'Тогда используем твой подарок. Посмотрим следующий слой этой истории.');
+    await runPaidThreeCardReading(chatId, session, session.reading?.question || 'Посмотреть следующий слой этой истории');
+    return;
+  }
+  if (session?.readingOfferShown && session?.pendingReadingQuestion && !session?.pendingPayment && affirmative) {
+    try {
+      await createPaymentInvoice(chatId, session, 'reading', 'STARS');
+    } catch (err) {
+      console.error('[tarot-omen] Text confirmation payment handling failed:', err);
+      await telegramSendMessage(chatId, 'Не удалось открыть оплату. Попробуй ещё раз.');
+    }
+    return;
+  }
+
+  // ===== ONE FREE READING EVERY 3 DAYS AFTER THE FREE WINDOW =====
+  // Every 72 hours the user can unlock one new free three-card reading while
+  // keeping the same story/context. After that reading, the normal three-message
+  // conversation window becomes available again. This free cooldown reading does
+  // not include ElevenLabs voice; voice is reserved for the first free reading
+  // and paid readings.
+  if (session?.reading &&
+      session.freeConversationUsed >= FREE_CONVERSATION_LIMIT &&
+      Number(session.paidReadingsRemaining || 0) === 0 &&
+      !session.pendingGiftReading &&
+      session.freeCooldownAvailableAt &&
+      Date.now() >= session.freeCooldownAvailableAt) {
+    try {
+      const cooldownQuestion = session.pendingReadingQuestion || session.reading.question || text;
+      await telegramSendMessage(chatId, '72 часа прошли. Если хочешь, можем снова посмотреть на эту историю через новый расклад.');
+      await runFreeCooldownThreeCardReading(chatId, session, cooldownQuestion);
+      return;
+    } catch (err) {
+      console.error('[tarot-omen] Free cooldown reading error:', err);
+      await telegramSendMessage(chatId, 'Не смог сейчас сделать новый расклад. Попробуй ещё раз.');
+      return;
+    }
+  }
+
+  // ===== PAID CONVERSATION AFTER A PAID READING =====
+  if (session?.reading && session.paidContinuation === true && session.paidConversationUsed < PAID_CONVERSATION_LIMIT) {
+    try {
+      const result = await generateConversationResponse({
+        userName,
+        originalQuestion: session.reading.question,
+        cards: session.reading.cards,
+        interpretation: session.reading.interpretation,
+        history: session.history,
+        latestMessage: text
+      });
+
+      session.paidConversationUsed += 1;
+      if (session.paidConversationUsed >= PAID_CONVERSATION_LIMIT) {
+        session.freeCooldownUsed = false;
+        session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
+      }
+      session.history.push({ role: 'user', text });
+      session.history.push({ role: 'omen', text: result.reply });
+
+      await telegramSendMessage(chatId, result.reply);
+      await telegramSendMessage(chatId, result.nextMessage);
+
+      if (result.readingOffer && result.readingQuestion) {
+        session.pendingReadingQuestion = result.readingQuestion;
+      }
+
+      if (session.paidConversationUsed >= PAID_CONVERSATION_LIMIT) {
+        session.paidReadingActive = false;
+        if (Number(session.paidReadingsRemaining || 0) > 0) {
+          await offerGiftReading(chatId, session);
+        } else {
+          await telegramSendMessage(
+            chatId,
+            'Эта часть истории завершена. Если захочешь продолжить сейчас, можно открыть новый пакет — в нём снова будет два расклада: один оплаченный и ещё один в подарок. Если не спешишь, через 72 часа снова будет доступен бесплатный расклад, и мы продолжим эту же историю.'
+          );
+          await offerPaidContinuation(chatId, session, result.readingQuestion || 'Посмотреть ситуацию с другой стороны отдельным раскладом');
+        }
+      }
+      return;
+    } catch (err) {
+      console.error('[tarot-omen] Paid conversation error:', err);
+      await telegramSendMessage(chatId, 'Не смог сейчас продолжить мысль. Попробуй ещё раз.');
+      return;
+    }
+  }
 
   // ===== FREE CONVERSATION AFTER A COMPLETED READING =====
   if (session?.reading && session.freeConversationUsed < FREE_CONVERSATION_LIMIT) {
@@ -951,24 +1688,27 @@ async function handleTelegramUpdate(update) {
       });
 
       session.freeConversationUsed += 1;
+      session.freeCooldownUsed = false;
+      session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
       session.history.push({ role: 'user', text });
       session.history.push({ role: 'omen', text: result.reply });
 
-      // NEVER call ElevenLabs for free follow-up messages.
       await telegramSendMessage(chatId, result.reply);
-
-      // Every conversational answer must either open a meaningful next step
-      // with a question or close the current thought with a complete conclusion.
       await telegramSendMessage(chatId, result.nextMessage);
 
-      // The third free reply ends the free conversational window. We do not
-      // start a new AI chat automatically after that point.
+      if (result.readingOffer && result.readingQuestion) {
+        session.pendingReadingQuestion = result.readingQuestion;
+        await offerPaidContinuation(chatId, session, result.readingQuestion);
+      }
+
       if (session.freeConversationUsed >= FREE_CONVERSATION_LIMIT) {
-        await telegramSendMessage(
-          chatId,
-          'На этом я бы остановился. Если захочешь продолжить эту историю, следующий шаг лучше уже посмотреть отдельным раскладом.'
-        );
-        session.readingOfferShown = true;
+        if (!result.readingOffer) {
+          await telegramSendMessage(
+            chatId,
+            'На этом я бы остановился. Если захочешь продолжить сейчас, можно открыть новый пакет — один расклад и ещё один в подарок. Если не спешишь, подожди 72 часа — и снова станет доступен бесплатный расклад, после которого мы продолжим эту же историю.'
+          );
+          await offerPaidContinuation(chatId, session, 'Посмотреть следующий слой этой истории отдельным раскладом');
+        }
       }
       return;
     } catch (err) {
@@ -978,13 +1718,30 @@ async function handleTelegramUpdate(update) {
     }
   }
 
-  // Until payment is connected, do not allow unlimited free AI chat after the
-  // three-message conversation window.
-  if (session?.reading && session.freeConversationUsed >= FREE_CONVERSATION_LIMIT) {
-    await telegramSendMessage(
-      chatId,
-      'Если захочешь продолжить эту историю, можем посмотреть следующий вопрос отдельным раскладом.'
-    );
+  // No unlimited free AI chat. Once the free window is over, only a paid
+  // continuation can create another reading/conversation in this session.
+  if (session?.reading &&
+      session.freeConversationUsed >= FREE_CONVERSATION_LIMIT &&
+      Number(session.paidReadingsRemaining || 0) === 0 &&
+      !session.pendingGiftReading) {
+    if (!session.readingOfferShown) {
+      await telegramSendMessage(chatId, 'Если захочешь продолжить эту историю сейчас, можно открыть новый пакет — один расклад и ещё один в подарок. Если не спешишь, подожди 72 часа — и снова станет доступен бесплатный расклад, после которого мы продолжим эту же историю.');
+      await offerPaidContinuation(chatId, session, session.pendingReadingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом');
+    }
+    return;
+  }
+
+  // A paid package is finite only after both included readings have been used.
+  if (session?.reading && session.paidContinuation === true && Number(session.paidReadingsRemaining || 0) === 0 && session.paidConversationUsed >= PAID_CONVERSATION_LIMIT) {
+    if (!session.readingOfferShown && !session.pendingGiftReading) {
+      await telegramSendMessage(chatId, 'Оба расклада из этого пакета использованы. Если захочешь продолжить сейчас, можно открыть новый пакет — снова два расклада, второй в подарок. Если не спешишь, через 72 часа снова будет доступен бесплатный расклад в рамках этой истории.');
+      await offerPaidContinuation(chatId, session, 'Посмотреть новый слой этой истории отдельным раскладом');
+    }
+    return;
+  }
+
+  // A package may still contain its included gift reading.
+  if (session?.pendingGiftReading && Number(session.paidReadingsRemaining || 0) > 0) {
     return;
   }
 
@@ -1008,9 +1765,9 @@ async function handleTelegramUpdate(update) {
 
     const result = await interpretationPromise;
 
-    // Voice: only the first free reading is voiced. Later readings will be voiced
-    // only after paidContinuation is granted by the future payment flow.
-    const includeVoice = !session || session.paidContinuation === true;
+    // The very first free reading includes voice. Every later paid reading also
+    // includes voice; the user never pays separately for the audio.
+    const includeVoice = !session?.freeReadingUsed;
     if (includeVoice) {
       try {
         const voiceBuffer = await elevenLabsTextToSpeech(result.voiceInterpretation);
@@ -1045,8 +1802,18 @@ async function handleTelegramUpdate(update) {
       },
       history: [],
       freeConversationUsed: 0,
+      paidConversationUsed: 0,
+      paidReadingsRemaining: 0,
+      paidReadingActive: false,
+      paidPackageKind: 'reading',
+      pendingGiftReading: false,
       paidContinuation: PAID_CONTINUATION_DEFAULT,
-      readingOfferShown: false
+      readingOfferShown: false,
+      pendingReadingQuestion: '',
+      pendingPayment: null,
+      freeReadingUsed: true,
+      freeCooldownUsed: false,
+      freeCooldownAvailableAt: Date.now() + FREE_COOLDOWN_MS
     });
   } catch (err) {
     console.error('[tarot-omen] Telegram reading error:', err);
@@ -1057,6 +1824,21 @@ async function handleTelegramUpdate(update) {
     }
   }
 }
+
+app.post('/lava-webhook', (req, res) => {
+  const providedKey = String(req.get('X-Api-Key') || '');
+  if (!LAVA_WEBHOOK_API_KEY || providedKey !== LAVA_WEBHOOK_API_KEY) {
+    return res.sendStatus(401);
+  }
+
+  // Acknowledge quickly. LAVA retries non-2xx responses, so all processing is
+  // intentionally performed after the 200 response.
+  res.sendStatus(200);
+
+  handleLavaWebhook(req.body).catch((err) => {
+    console.error('[tarot-omen] LAVA webhook handler error:', err);
+  });
+});
 
 app.post('/telegram-webhook', (req, res) => {
   res.sendStatus(200);
