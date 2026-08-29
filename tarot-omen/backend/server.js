@@ -674,13 +674,11 @@ async function generateConversationResponse({ userName, originalQuestion, cards,
   const userMessage = `Telegram first name: ${userName || '(not available)'}\n\nOriginal question:\n"${originalQuestion}"\n\nCards from the completed reading:\n${cardBlock}\n\nOriginal interpretation:\n${interpretation}\n\nConversation so far:\n${historyBlock}\n\nLatest user message:\n"${latestMessage}"\n\nConversation allowance: this reply is message ${conversationUsed + 1} of ${conversationLimit}; ${remainingMessages} message(s) remain before the current free conversation window ends. Do not mention this allowance to the user. If a genuinely new layer/question has emerged, prefer setting reading_offer=true so the next spread can become the natural continuation. If no new layer has emerged, do not invent one just to sell a spread.`;
 
   let lastError;
-  let response = null;
-
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 60000);
     try {
-      response = await fetch(
+      const response = await fetch(
         'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent',
         {
           method: 'POST',
@@ -747,10 +745,9 @@ async function generateConversationResponse({ userName, originalQuestion, cards,
       const transient = /high demand|429|503|502|500|temporar/i.test(lastError?.message || '');
       console.error(`[tarot-omen] Conversation attempt ${attempt} failed${transient ? ' (transient Gemini load)' : ''}:`, lastError);
       if (attempt < 3) {
-        const retryAfterHeader = response?.headers?.get?.('retry-after');
-        const retryAfterSeconds = Number(retryAfterHeader || 0);
-        const delay = retryAfterSeconds > 0
-          ? Math.min(retryAfterSeconds * 1000, 10000)
+        const retryAfter = Number(response?.headers?.get?.('retry-after') || 0);
+        const delay = retryAfter > 0
+          ? Math.min(retryAfter * 1000, 10000)
           : attempt * 1800;
         await sleep(delay);
       }
@@ -1002,7 +999,7 @@ async function telegramSendInvoice(chatId, { title, description, stars, payload 
       payload,
       currency: 'XTR',
       prices: [{ label: title, amount: stars }],
-      start_parameter: `omen_${payload.slice(-24)}`
+      start_parameter: `omen_${String(payload).replace(/[^A-Za-z0-9_-]/g, '_').slice(-48)}`
     })
   });
 
@@ -1041,7 +1038,7 @@ async function offerPaidContinuation(chatId, session, readingQuestion = '') {
 
   await telegramSendInlineKeyboard(
     chatId,
-    'Если хочешь продолжить эту историю сейчас, можно открыть следующий расклад. После оплаты ты получишь два расклада: один сейчас и ещё один — в подарок. Если не спешишь, можно подождать 72 часа — тогда я смогу бесплатно продолжить именно этот разговор, без нового расклада.',
+    'Если хочешь продолжить эту историю сейчас, можно открыть следующий расклад. После оплаты ты получишь два расклада: один сейчас и ещё один — в подарок. Если не спешишь, можно подождать 72 часа — после этого снова будет доступен бесплатный расклад, и мы продолжим эту же историю.',
     [
       [{ text: `⭐ Telegram Stars — ${PAID_READING_STARS}`, callback_data: 'pay:stars:reading' }],
       [{ text: `💳 Карта / СБП — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB' }],
@@ -1130,23 +1127,32 @@ async function lavaCreateInvoice(chatId, session, kind, currency) {
   try {
     data = JSON.parse(raw);
   } catch {
+    console.error('[tarot-omen] LAVA returned non-JSON response:', {
+      status: response.status,
+      bodyPreview: raw.slice(0, 500)
+    });
     throw new Error(`LAVA returned invalid JSON (HTTP ${response.status}).`);
   }
 
   if (!response.ok) {
-    console.error('[tarot-omen] LAVA invoice error:', data);
-    throw new Error(data?.message || data?.error?.message || `LAVA API HTTP ${response.status}`);
+    console.error('[tarot-omen] LAVA invoice error:', {
+      status: response.status,
+      data
+    });
+    throw new Error(data?.message || data?.error?.message || data?.error || `LAVA API HTTP ${response.status}`);
   }
 
-  const paymentUrl =
-    data?.paymentUrl ||
-    data?.payment_url ||
-    data?.invoiceUrl ||
-    data?.invoice_url ||
-    data?.url ||
-    data?.result?.paymentUrl ||
-    data?.result?.payment_url ||
-    data?.result?.url;
+  const paymentUrl = findFirstDeepValue(data, [
+    'paymentUrl',
+    'payment_url',
+    'invoiceUrl',
+    'invoice_url',
+    'paymentLink',
+    'payment_link',
+    'payUrl',
+    'pay_url',
+    'url'
+  ]);
 
   if (!paymentUrl) {
     console.error('[tarot-omen] LAVA invoice response without payment URL:', data);
@@ -1478,7 +1484,13 @@ async function handleTelegramUpdate(update) {
       }
     } catch (err) {
       console.error('[tarot-omen] Payment button handling failed:', err);
-      if (chatId) await telegramSendMessage(chatId, 'Не удалось открыть оплату. Попробуй ещё раз.');
+      if (chatId) {
+        if (/No reading is available|Сначала нужен расклад/.test(err?.message || '') || !session) {
+          await telegramSendMessage(chatId, 'Эта кнопка относится к предыдущей сессии. Начни новый расклад, и я создам новую оплату.');
+        } else {
+          await telegramSendMessage(chatId, 'Не удалось открыть оплату. Попробуй ещё раз.');
+        }
+      }
     } finally {
       await fetch(`${TELEGRAM_API}/answerCallbackQuery`, {
         method: 'POST',
@@ -1725,7 +1737,6 @@ async function handleTelegramUpdate(update) {
       session.history = session.history.slice(-24);
 
       await telegramSendMessage(chatId, result.reply);
-      await telegramSendMessage(chatId, result.nextMessage);
 
       if (session.freeConversationUsed >= FREE_CONVERSATION_LIMIT) {
         session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
@@ -1735,6 +1746,8 @@ async function handleTelegramUpdate(update) {
           'Если хочешь продолжить эту историю сейчас, можно открыть следующий расклад. После оплаты ты получишь два расклада: один сейчас и ещё один — в подарок. Если не хочешь оплачивать сейчас, можно подождать 72 часа — после этого снова будет доступен бесплатный расклад, и мы продолжим эту же историю.'
         );
         await offerPaidContinuation(chatId, session, offerQuestion);
+      } else {
+        await telegramSendMessage(chatId, result.nextMessage);
       }
       return;
     } catch (err) {
