@@ -503,17 +503,16 @@ async function cardPathFor(card) {
   throw new Error(`Card image not found for "${card.name}" (${slug}).`);
 }
 
-// The spread is composed from the actual table dimensions so a rotated card
-// can never be pushed outside the canvas. The previous fixed coordinates were
-// close to the right edge and made the right card clip after rotation.
-async function makeCardLayer(card, tableWidth, tableHeight, index) {
-  const input = await readFile(await cardPathFor(card));
+// Three-card spread layout. Positions are calculated from the actual table
+// dimensions in buildReadingImage() so rotated cards cannot be clipped at the
+// left/right edges when the source card ratio or table size changes.
+const CARD_ANGLES = [-7, 0, 7];
+const CARD_HEIGHT_FRACTION = 0.64;
 
-  // Keep the cards large, but leave enough room for the rotated bounding box.
-  const targetHeight = Math.min(700, Math.max(560, Math.round(tableHeight * 0.70)));
-  const baseAngle = [-7, 0, 7][index];
+async function makeCardLayer(card, angle, targetHeight) {
+  const input = await readFile(await cardPathFor(card));
   const totalRotation =
-    baseAngle + (card.orientation === 'reversed' ? 180 : 0);
+    angle + (card.orientation === 'reversed' ? 180 : 0);
 
   const cardRotated = await sharp(input)
     .resize({ height: targetHeight, fit: 'contain' })
@@ -555,64 +554,47 @@ async function makeCardLayer(card, tableWidth, tableHeight, index) {
   return { cardRotated, shadow };
 }
 
-function clampCompositePosition(center, size, canvasSize) {
-  return Math.max(0, Math.min(
-    Math.round(center - size / 2),
-    Math.max(0, canvasSize - size)
-  ));
-}
-
 async function buildReadingImage(cards) {
   if (!Array.isArray(cards) || cards.length !== 3) {
     throw new Error('Exactly three cards are required to build the spread image.');
   }
 
-  const tableInput = await readFile(TABLE_PATH);
-  const tableMeta = await sharp(tableInput).metadata();
+  const tableMeta = await sharp(TABLE_PATH).metadata();
   const tableWidth = Number(tableMeta.width || 1536);
   const tableHeight = Number(tableMeta.height || 1024);
+  const targetCardHeight = Math.round(tableHeight * CARD_HEIGHT_FRACTION);
 
   const layers = await Promise.all(
-    cards.map((card, index) => makeCardLayer(card, tableWidth, tableHeight, index))
+    cards.map((card, index) => makeCardLayer(card, CARD_ANGLES[index], targetCardHeight))
   );
 
-  // Deliberately keep the outer cards well inside the canvas. This also leaves
-  // room for the extra pixels created by rotation.
-  const centers = [
-    { x: tableWidth * 0.22, y: tableHeight * 0.50 },
-    { x: tableWidth * 0.50, y: tableHeight * 0.49 },
-    { x: tableWidth * 0.78, y: tableHeight * 0.50 }
-  ];
-
   const composites = [];
+  const centerXs = [0.20, 0.50, 0.80].map((fraction) => Math.round(tableWidth * fraction));
+  const centerY = Math.round(tableHeight * 0.52);
+
+  // Back cards first, center card last so the overlap is deterministic.
   const order = [0, 2, 1];
 
   for (const index of order) {
     const { cardRotated, shadow } = layers[index];
-    const center = centers[index];
-
     const cardMeta = await sharp(cardRotated).metadata();
     const shadowMeta = await sharp(shadow).metadata();
-
-    const cardLeft = clampCompositePosition(center.x, cardMeta.width, tableWidth);
-    const cardTop = clampCompositePosition(center.y, cardMeta.height, tableHeight);
-    const shadowLeft = clampCompositePosition(center.x + 10, shadowMeta.width, tableWidth);
-    const shadowTop = clampCompositePosition(center.y + 10, shadowMeta.height, tableHeight);
+    const centerX = centerXs[index];
 
     composites.push({
       input: shadow,
-      left: shadowLeft,
-      top: shadowTop
+      left: Math.round(centerX - shadowMeta.width / 2 + 10),
+      top: Math.round(centerY - shadowMeta.height / 2 + 10)
     });
 
     composites.push({
       input: cardRotated,
-      left: cardLeft,
-      top: cardTop
+      left: Math.round(centerX - cardMeta.width / 2),
+      top: Math.round(centerY - cardMeta.height / 2)
     });
   }
 
-  return sharp(tableInput)
+  return sharp(TABLE_PATH)
     .ensureAlpha()
     .modulate({ brightness: 1.35, saturation: 1.05 })
     .composite(composites)
@@ -658,9 +640,10 @@ Rules:
 - Never invent facts about the user's life.
 - Never claim certainty about the future.
 - Never assume or mention gender. Use the Telegram first name only when it sounds natural.
-- If the user reveals a genuinely new layer that would benefit from another spread, set reading_offer to true and formulate one specific reading_question for that new layer. Do not mention payment, credits, limits or sales inside reply or next_message.
-- If there is no genuinely new question, continue the conversation naturally.
-- Do not force a reading offer merely because a message limit exists.
+- If the user reveals a genuinely new layer that would benefit from another spread, set reading_offer to true and formulate one specific reading_question for that new layer. This is only a signal for the server; NEVER sell, charge, or end the conversation yourself. Do not mention payment, credits, limits or sales inside reply or next_message.
+- If there is no genuinely new layer, continue the conversation naturally around the EXISTING three-card reading.
+- A new user question does NOT automatically mean a new Tarot spread. Never generate or imply a new spread in this stage.
+- During this conversation stage, answer the user's latest message directly using the existing reading and history.
 - When the current free conversation window is ending, NEVER write a phrase like "На этом я бы остановился", "завершим", "на этом закончим" or any equivalent solely because the limit has been reached. The conversation should end naturally, or transition to a specific new reading only when the user's context genuinely creates one.
 - If reading_offer=true, the reading_question must describe the new layer that emerged from the user's words, not simply repeat the original question.
 - Return ONLY valid JSON with exactly these five fields:
@@ -1152,30 +1135,20 @@ async function lavaCreateInvoice(chatId, session, kind, currency) {
     throw new Error(data?.message || data?.error?.message || `LAVA API HTTP ${response.status}`);
   }
 
-  // Lava's current /api/v3/invoice contract returns paymentUrl. Keep the
-  // fallback lookup recursive so harmless response-shape changes do not break
-  // the Telegram button.
-  const paymentUrl = findFirstDeepValue(
-    data,
-    ['paymentUrl', 'payment_url', 'invoiceUrl', 'invoice_url', 'url']
-  );
+  const paymentUrl =
+    data?.paymentUrl ||
+    data?.payment_url ||
+    data?.invoiceUrl ||
+    data?.invoice_url ||
+    data?.url ||
+    data?.result?.paymentUrl ||
+    data?.result?.payment_url ||
+    data?.result?.url;
 
-  if (!paymentUrl || typeof paymentUrl !== 'string') {
-    console.error('[tarot-omen] LAVA invoice response without payment URL:', {
-      status: response.status,
-      keys: data && typeof data === 'object' ? Object.keys(data) : [],
-      response: data
-    });
+  if (!paymentUrl) {
+    console.error('[tarot-omen] LAVA invoice response without payment URL:', data);
     throw new Error('LAVA invoice was created but payment URL was not returned.');
   }
-
-  console.log('[tarot-omen] LAVA invoice created:', {
-    kind,
-    currency: normalizedCurrency,
-    amount,
-    offerId,
-    paymentUrl
-  });
 
   session.pendingLavaPayment = {
     kind,
@@ -1333,7 +1306,7 @@ function activatePaidPackage(session, kind = 'reading') {
   session.paidConversationUsed = 0;
   session.freeConversationUsed = FREE_CONVERSATION_LIMIT;
   session.freeCooldownUsed = false;
-  session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
+  session.freeCooldownAvailableAt = 0;
   session.readingOfferShown = false;
   session.pendingGiftReading = false;
 }
@@ -1593,16 +1566,137 @@ async function handleTelegramUpdate(update) {
     return;
   }
 
-  // ===== ONE FREE MESSAGE EVERY 3 DAYS AFTER THE FREE WINDOW =====
-  // After the initial three free conversation replies, the only free continuation
-  // is one AI reply every 72 hours. The 72-hour reply itself is also followed by
-  // the same hard gate; it never opens an unlimited chat.
+  // ===== FREE 72-HOUR CONTINUATION =====
+  // After the initial three-message conversation window is exhausted, the next
+  // free entitlement arrives only after 72 hours. That entitlement is a NEW
+  // three-card continuation reading, while keeping the same story/history.
   if (session?.reading &&
       session.freeConversationUsed >= FREE_CONVERSATION_LIMIT &&
       Number(session.paidReadingsRemaining || 0) === 0 &&
       !session.pendingGiftReading &&
-      session.freeCooldownAvailableAt &&
-      Date.now() >= session.freeCooldownAvailableAt) {
+      Date.now() >= Number(session.freeCooldownAvailableAt || 0)) {
+    try {
+      const continuationQuestion = session.pendingReadingQuestion || text;
+      const cards = drawThreeCards();
+      await telegramSendMessage(chatId, 'Мешаю карты...', true);
+      await telegramSendShuffleGif(chatId);
+
+      const interpretationPromise = generateInterpretation(continuationQuestion, cards, userName);
+      const spreadImage = await buildReadingImage(cards);
+      await telegramSendSpreadImage(chatId, spreadImage);
+      await telegramSendMessage(chatId, CARDS_CAPTION);
+      await sleep(1200);
+      const result = await interpretationPromise;
+
+      // The 72-hour free continuation stays text-only. Voice is reserved for
+      // the first free reading and paid readings.
+      await telegramSendMessage(chatId, result.interpretation);
+
+      try {
+        const followup = await generateFollowupQuestion({
+          userName,
+          originalQuestion: continuationQuestion,
+          cards,
+          interpretation: result.interpretation
+        });
+        await telegramSendMessage(chatId, followup);
+      } catch (followupErr) {
+        console.error('[tarot-omen] 72h follow-up question generation failed:', followupErr);
+      }
+
+      session.reading = {
+        question: continuationQuestion,
+        cards,
+        interpretation: result.interpretation
+      };
+      session.history = Array.isArray(session.history) ? session.history.slice(-24) : [];
+      session.freeConversationUsed = 0;
+      session.paidConversationUsed = 0;
+      session.paidReadingActive = false;
+      session.paidContinuation = false;
+      session.pendingReadingQuestion = '';
+      session.readingOfferShown = false;
+      session.pendingGiftReading = false;
+      session.freeCooldownUsed = false;
+      session.freeCooldownAvailableAt = 0;
+      return;
+    } catch (err) {
+      console.error('[tarot-omen] Free 72-hour continuation reading failed:', err);
+      await telegramSendMessage(chatId, 'Не удалось получить продолжение расклада. Попробуй ещё раз.');
+      return;
+    }
+  }
+
+  // ===== HARD GATE AFTER FREE CONVERSATION WINDOW =====
+  // Once the three free conversation replies are used, NOTHING goes to Gemini
+  // until the user either starts a paid continuation or reaches the 72-hour
+  // entitlement above. This prevents the bot from turning into an unlimited chat.
+  if (session?.reading &&
+      session.freeConversationUsed >= FREE_CONVERSATION_LIMIT &&
+      Number(session.paidReadingsRemaining || 0) === 0 &&
+      !session.pendingGiftReading) {
+    if (!session.readingOfferShown) {
+      const offerQuestion = session.pendingReadingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом';
+      await telegramSendMessage(
+        chatId,
+        'Чтобы продолжить эту историю сейчас, можно открыть следующий расклад. После оплаты ты получишь два расклада: один сейчас и ещё один — в подарок. Если не хочешь оплачивать сейчас, ничего страшного — через 72 часа у тебя снова появится бесплатный расклад, и мы продолжим эту же историю с сохранённым контекстом.'
+      );
+      await offerPaidContinuation(chatId, session, offerQuestion);
+    }
+    return;
+  }
+
+  // ===== PAID CONVERSATION AFTER A PAID READING =====
+  if (session?.reading && session.paidContinuation === true && session.paidConversationUsed < PAID_CONVERSATION_LIMIT) {
+    try {
+      const result = await generateConversationResponse({
+        userName,
+        originalQuestion: session.reading.question,
+        cards: session.reading.cards,
+        interpretation: session.reading.interpretation,
+        history: session.history,
+        latestMessage: text,
+        conversationUsed: session.paidConversationUsed,
+        conversationLimit: PAID_CONVERSATION_LIMIT
+      });
+
+      session.paidConversationUsed += 1;
+      if (result.readingOffer && result.readingQuestion) {
+        session.pendingReadingQuestion = result.readingQuestion;
+      }
+
+      session.history.push({ role: 'user', text });
+      session.history.push({ role: 'omen', text: result.reply });
+      session.history.push({ role: 'omen', text: result.nextMessage });
+      session.history = session.history.slice(-24);
+
+      await telegramSendMessage(chatId, result.reply);
+      await telegramSendMessage(chatId, result.nextMessage);
+
+      if (session.paidConversationUsed >= PAID_CONVERSATION_LIMIT) {
+        session.paidReadingActive = false;
+        session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
+        if (Number(session.paidReadingsRemaining || 0) > 0) {
+          await offerGiftReading(chatId, session);
+        } else {
+          await telegramSendMessage(
+            chatId,
+            'Эта часть истории подошла к завершению. Можно открыть новое платное продолжение — в нём снова будет два расклада, второй в подарок. Если не спешишь, через 72 часа появится бесплатный расклад, и мы продолжим эту же историю.'
+          );
+          session.readingOfferShown = false;
+          await offerPaidContinuation(chatId, session, session.pendingReadingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом');
+        }
+      }
+      return;
+    } catch (err) {
+      console.error('[tarot-omen] Paid conversation error:', err);
+      await telegramSendMessage(chatId, 'Не смог сейчас продолжить мысль. Попробуй ещё раз.');
+      return;
+    }
+  }
+
+  // ===== FREE CONVERSATION AFTER A COMPLETED READING =====
+  if (session?.reading && session.freeConversationUsed < FREE_CONVERSATION_LIMIT) {
     try {
       const result = await generateConversationResponse({
         userName,
@@ -1615,171 +1709,36 @@ async function handleTelegramUpdate(update) {
         conversationLimit: FREE_CONVERSATION_LIMIT
       });
 
-      session.freeCooldownUsed = true;
-      session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
-      session.history.push({ role: 'user', text });
-      session.history.push({ role: 'omen', text: result.reply });
-
-      if (result.readingOffer && result.readingQuestion) {
-        session.pendingReadingQuestion = result.readingQuestion;
-      }
-
-      session.history = session.history.slice(-24);
-      await telegramSendMessage(chatId, result.reply);
-      await offerPaidContinuation(
-        chatId,
-        session,
-        session.pendingReadingQuestion || result.readingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом'
-      );
-      return;
-    } catch (err) {
-      console.error('[tarot-omen] Free cooldown conversation error:', err);
-      await telegramSendMessage(chatId, 'Не смог сейчас продолжить мысль. Попробуй ещё раз.');
-      return;
-    }
-  }
-
-
-  // ===== PAID CONVERSATION AFTER A PAID READING =====
-  if (session?.reading && session.paidContinuation === true && session.paidConversationUsed < PAID_CONVERSATION_LIMIT) {
-    try {
-      const usedBefore = session.paidConversationUsed;
-      const result = await generateConversationResponse({
-        userName,
-        originalQuestion: session.reading.question,
-        cards: session.reading.cards,
-        interpretation: session.reading.interpretation,
-        history: session.history,
-        latestMessage: text,
-        conversationUsed: usedBefore,
-        conversationLimit: PAID_CONVERSATION_LIMIT
-      });
-
-      session.paidConversationUsed += 1;
-      if (session.paidConversationUsed >= PAID_CONVERSATION_LIMIT) {
-        session.freeCooldownUsed = false;
-        session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
-      }
-
-      session.history.push({ role: 'user', text });
-      session.history.push({ role: 'omen', text: result.reply });
-
-      if (result.readingOffer && result.readingQuestion) {
-        session.pendingReadingQuestion = result.readingQuestion;
-      }
-
-      // The third paid conversation answer is also a hard gate. Do not send
-      // another question after it. The user gets only the next allowed action.
-      if (session.paidConversationUsed >= PAID_CONVERSATION_LIMIT) {
-        session.paidReadingActive = false;
-        session.history = session.history.slice(-24);
-        await telegramSendMessage(chatId, result.reply);
-
-        if (Number(session.paidReadingsRemaining || 0) > 0) {
-          await offerGiftReading(chatId, session);
-        } else {
-          await offerPaidContinuation(
-            chatId,
-            session,
-            session.pendingReadingQuestion || result.readingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом'
-          );
-        }
-        return;
-      }
-
-      session.history.push({ role: 'omen', text: result.nextMessage });
-      session.history = session.history.slice(-24);
-
-      await telegramSendMessage(chatId, result.reply);
-      await telegramSendMessage(chatId, result.nextMessage);
-      return;
-    } catch (err) {
-      console.error('[tarot-omen] Paid conversation error:', err);
-      await telegramSendMessage(chatId, 'Не смог сейчас продолжить мысль. Попробуй ещё раз.');
-      return;
-    }
-  }
-
-  // ===== FREE CONVERSATION AFTER A COMPLETED READING =====
-  if (session?.reading && session.freeConversationUsed < FREE_CONVERSATION_LIMIT) {
-    try {
-      const usedBefore = session.freeConversationUsed;
-      const result = await generateConversationResponse({
-        userName,
-        originalQuestion: session.reading.question,
-        cards: session.reading.cards,
-        interpretation: session.reading.interpretation,
-        history: session.history,
-        latestMessage: text,
-        conversationUsed: usedBefore,
-        conversationLimit: FREE_CONVERSATION_LIMIT
-      });
-
       session.freeConversationUsed += 1;
-      session.freeCooldownUsed = false;
-      session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
-
-      session.history.push({ role: 'user', text });
-      session.history.push({ role: 'omen', text: result.reply });
-
       if (result.readingOffer && result.readingQuestion) {
+        // Remember the emerging new layer, but DO NOT show a payment wall yet.
+        // The user must first receive the full short free conversation.
         session.pendingReadingQuestion = result.readingQuestion;
       }
 
-      // The third free answer is a hard gate. Do not send the model's follow-up
-      // question and do not call the payment flow before the third answer.
-      if (session.freeConversationUsed >= FREE_CONVERSATION_LIMIT) {
-        await telegramSendMessage(chatId, result.reply);
-        session.history = session.history.slice(-24);
-        await offerPaidContinuation(
-          chatId,
-          session,
-          session.pendingReadingQuestion || result.readingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом'
-        );
-        return;
-      }
-
+      session.history.push({ role: 'user', text });
+      session.history.push({ role: 'omen', text: result.reply });
       session.history.push({ role: 'omen', text: result.nextMessage });
       session.history = session.history.slice(-24);
 
       await telegramSendMessage(chatId, result.reply);
       await telegramSendMessage(chatId, result.nextMessage);
+
+      if (session.freeConversationUsed >= FREE_CONVERSATION_LIMIT) {
+        session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
+        const offerQuestion = session.pendingReadingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом';
+        await telegramSendMessage(
+          chatId,
+          'Если хочешь продолжить эту историю сейчас, можно открыть следующий расклад. После оплаты ты получишь два расклада: один сейчас и ещё один — в подарок. Если не хочешь оплачивать сейчас, можно подождать 72 часа — после этого снова будет доступен бесплатный расклад, и мы продолжим эту же историю.'
+        );
+        await offerPaidContinuation(chatId, session, offerQuestion);
+      }
       return;
     } catch (err) {
       console.error('[tarot-omen] Telegram conversation error:', err);
       await telegramSendMessage(chatId, 'Не смог сейчас продолжить мысль. Попробуй ещё раз.');
       return;
     }
-  }
-
-  // No unlimited free AI chat. Once the free window is over, this branch is a
-  // hard gate: do not call Gemini, do not draw cards and do not answer the new
-  // question. Only payment or the 72-hour option is available.
-  if (session?.reading &&
-      session.freeConversationUsed >= FREE_CONVERSATION_LIMIT &&
-      Number(session.paidReadingsRemaining || 0) === 0 &&
-      !session.pendingGiftReading) {
-    await offerPaidContinuation(
-      chatId,
-      session,
-      session.pendingReadingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом'
-    );
-    return;
-  }
-
-
-  // A paid package is finite only after both included readings have been used.
-  if (session?.reading && session.paidContinuation === true && Number(session.paidReadingsRemaining || 0) === 0 && session.paidConversationUsed >= PAID_CONVERSATION_LIMIT) {
-    if (!session.readingOfferShown && !session.pendingGiftReading) {
-      await telegramSendMessage(chatId, 'Оба расклада из этого пакета использованы. Если захочешь продолжить сейчас, можно открыть новый пакет — снова два расклада, второй в подарок. Если не спешишь, через 72 часа будет доступен ещё один бесплатный ответ в рамках этой истории.');
-      await offerPaidContinuation(chatId, session, 'Посмотреть новый слой этой истории отдельным раскладом');
-    }
-    return;
-  }
-
-  // A package may still contain its included gift reading.
-  if (session?.pendingGiftReading && Number(session.paidReadingsRemaining || 0) > 0) {
-    return;
   }
 
   try {
@@ -1850,7 +1809,7 @@ async function handleTelegramUpdate(update) {
       pendingPayment: null,
       freeReadingUsed: true,
       freeCooldownUsed: false,
-      freeCooldownAvailableAt: Date.now() + FREE_COOLDOWN_MS
+      freeCooldownAvailableAt: 0
     });
   } catch (err) {
     console.error('[tarot-omen] Telegram reading error:', err);
