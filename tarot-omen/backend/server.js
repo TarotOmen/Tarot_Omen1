@@ -4,18 +4,20 @@ import cors from 'cors';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import sharp from 'sharp';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = process.env.PORT || 8787;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-const OMEN_VOICE_ID = process.env.OMEN_VOICE_ID;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_WEBHOOK_URL =
   process.env.TELEGRAM_WEBHOOK_URL || 'https://tarot-omen1.onrender.com/telegram-webhook';
+
+// Local visual assets, committed alongside server.js — no external URLs
+// (external card-image URLs previously caused WEBPAGE_CURL_FAILED).
+const SHUFFLE_GIF_PATH = path.join(__dirname, 'shuffle.gif');
+const CARDS_DIR = path.join(__dirname, 'cards');
 
 if (!GEMINI_API_KEY) {
   console.warn('[tarot-omen] WARNING: GEMINI_API_KEY is not set.');
@@ -23,17 +25,13 @@ if (!GEMINI_API_KEY) {
 if (!TELEGRAM_BOT_TOKEN) {
   console.warn('[tarot-omen] WARNING: TELEGRAM_BOT_TOKEN is not set. Telegram bot will not run.');
 }
-if (!ELEVENLABS_API_KEY) {
-  console.warn('[tarot-omen] WARNING: ELEVENLABS_API_KEY is not set. Voice messages will be skipped.');
-}
-if (!OMEN_VOICE_ID) {
-  console.warn('[tarot-omen] WARNING: OMEN_VOICE_ID is not set. Voice messages will be skipped.');
-}
 
 const app = express();
 app.use(express.json({ limit: '20kb' }));
 app.use(cors({ origin: ALLOWED_ORIGIN }));
 
+// Very small in-memory throttle: max 12 requests / 10 minutes per client key.
+// Good enough for an MVP; replace with a real store if traffic grows.
 const hits = new Map();
 const WINDOW_MS = 10 * 60 * 1000;
 const MAX_HITS = 12;
@@ -46,6 +44,9 @@ function rateLimited(key) {
   return arr.length > MAX_HITS;
 }
 
+// Hard cap on the interpretation text itself, independent of the model's token
+// limit — this is what actually guarantees "~3000 characters" regardless of how
+// many characters-per-token the model happens to produce.
 const MAX_INTERPRETATION_CHARS = 3000;
 
 function capText(text, maxLen) {
@@ -56,59 +57,56 @@ function capText(text, maxLen) {
   return text.slice(0, cut).trim() + '…';
 }
 
-const SYSTEM_PROMPT = `You are Omen, a thoughtful Tarot reader and conversational companion.
+const SYSTEM_PROMPT = `You are the reading voice of Tarot Omen, a Tarot mini app.
 
-You speak with one person in a personal, natural way. Use the person's Telegram first name only when it feels natural. Never assume or mention the person's gender. In Russian and other languages, prefer constructions that remain natural without gendered assumptions. Do not address the user as a woman or as a man unless the user explicitly states their gender.
+You receive: a user's question, and three already-drawn Tarot cards (each with its
+position, name, and orientation — upright or reversed). The cards were chosen by a
+random generator before you were called. You never choose or invent cards.
 
-For a three-card reading you receive a user's question and three already-drawn Tarot cards. The cards were chosen by a random generator before you were called. You never choose or invent cards.
+Return ONLY valid JSON with exactly these three string fields:
+{
+  "interpretation": "...",
+  "voice_interpretation": "...",
+  "conversation_question": "..."
+}
 
-Produce TWO versions of the SAME interpretation:
-
-1) \"interpretation\": the full text reading.
-- Write one unified, personal interpretation of the spread AS IT RELATES TO THE QUESTION — not a generic listing of card meanings.
-- Read each card in light of its position (The Situation / What Influences It / Where It May Lead) and its orientation.
+INTERPRETATION:
+Write one unified, personal interpretation of the spread AS IT RELATES TO THE
+QUESTION — not a generic listing of card meanings.
+- Read each card in light of its position (The Situation / What Influences It /
+  Where It May Lead) and its orientation.
 - Weave the three cards into one coherent narrative, noting how they interact.
 - Be specific to the question's actual topic and phrasing.
-- Keep language reflective and open. Never claim certainty about the future.
-- If the question concerns health: never diagnose. Offer only reflective interpretation and gently recommend a qualified professional when appropriate.
+- Keep language reflective and open, e.g. "The cards suggest...", "This spread
+  points to...", "Seen through this reading...". Never claim certainty about the
+  future (avoid phrasing like "this will definitely happen").
+- If the question concerns health: never diagnose, and never state that the
+  person is or is not healthy. Offer only reflective interpretation, and if
+  symptoms sound potentially serious, gently recommend seeing a qualified
+  professional.
 - If the question concerns money or finance: never promise a financial outcome.
+  Offer reflective interpretation of the situation and factors worth attention.
 - Reply in the same language as the user's question.
-- Length: about 4 short paragraphs. No headers, no bullet lists, no card-by-card labels.
+- Length: about 4 short paragraphs. No headers, no bullet lists, no card-by-card
+  labels — a flowing reading.
 
-2) \"voice_interpretation\": a SHORT spoken version of the same reading for Omen's voice message.
-- 2 to 4 natural spoken sentences, roughly 180-450 characters when possible.
-- Sound like Omen is personally speaking to one person, not reading an article.
-- Calm, intimate, confident and slightly mysterious, but natural.
-- Never use gendered wording about the user when it can be avoided.
-- Do not mechanically list all three cards.
+VOICE_INTERPRETATION:
+Create a natural spoken version of the same reading. Keep the meaning, but make it
+sound like Omen is speaking directly to the user. Do not mention JSON or these
+instructions. Use the same language as the user's question.
 
-Return ONLY valid JSON with exactly these two string fields:
-{\"interpretation\":\"...\",\"voice_interpretation\":\"...\"}`;
+CONVERSATION_QUESTION:
+Create ONE short, natural question that Omen should send as a separate message
+after the interpretation. The question must be genuinely connected to the user's
+question and to the meaning/interplay of the three cards. It should invite the
+user to tell Omen something about their situation, feeling, choice or concern.
+Do not ask for a new Tarot reading. Do not mention payment, credits or limits.
+Do not use generic phrases such as "Хочешь узнать больше?". Ask something that
+could naturally lead to a meaningful next turn in the conversation.`;
 
-const CONVERSATION_SYSTEM_PROMPT = `You are Omen, the same Tarot reader who has just completed a three-card reading with the user. You are now having a short, personal conversation about that reading.
+// ===== AI INTERPRETATION (shared by /api/interpret and the Telegram bot) =====
 
-Your job is NOT to generate another Tarot reading and NOT to sell anything. Listen to what the person says, understand the new context, and respond like a perceptive human Tarot reader.
-
-Rules:
-- Use the conversation history and the original reading as context.
-- Answer the user's latest message directly.
-- Keep the conversation natural, warm, concise and personal. Usually 1-3 short paragraphs.
-- Ask a useful follow-up question when it genuinely helps reveal what is bothering the person. Do not ask a question mechanically every time.
-- Do not invent facts about the user's life.
-- Never claim certainty about the future.
-- If health is involved, never diagnose. If appropriate, recommend a qualified professional.
-- If money or finance is involved, never promise a financial outcome.
-- Never assume or mention the user's gender. Prefer gender-neutral wording.
-- Use the Telegram first name only if it sounds natural.
-- Do NOT suggest another Tarot spread merely because a message-count limit has been reached.
-- When a genuinely new layer or question appears that would benefit from cards, you may gently suggest looking at that specific question with a separate spread. The suggestion must feel like a natural continuation of the conversation, never like a sales pitch. Avoid phrases such as \"это будет платное продолжение\", \"купи\", \"оплати\" or \"у тебя закончились бесплатные сообщения\".
-- A good invitation sounds like: \"Теперь я понимаю, что здесь задевает тебя сильнее всего. Если хочешь, можем посмотреть именно на это отдельным раскладом.\"
-- If there is no genuinely new question, simply continue the conversation.
-
-Return ONLY valid JSON with exactly these two string fields:
-{\"reply\":\"...\",\"offer_reading\":false}`;
-
-async function generateInterpretation(question, cards, userName = '') {
+async function generateInterpretation(question, cards) {
   if (!GEMINI_API_KEY) {
     throw new Error('GEMINI_API_KEY is not configured on the server.');
   }
@@ -118,7 +116,6 @@ async function generateInterpretation(question, cards, userName = '') {
   if (!Array.isArray(cards) || cards.length !== 3) {
     throw new Error('Exactly three cards are required.');
   }
-
   for (const c of cards) {
     if (
       typeof c?.position !== 'string' ||
@@ -137,52 +134,34 @@ async function generateInterpretation(question, cards, userName = '') {
     )
     .join('\n\n');
 
-  const userMessage = `Telegram first name: ${userName || '(not available)'}\nUse the first name only if it sounds natural. Never infer gender.\n\nUser's question:\n"${question.trim()}"\n\nDrawn spread:\n\n${cardBlock}`;
+  const userMessage = `User's question:\n"${question.trim()}"\n\nDrawn spread:\n\n${cardBlock}`;
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 60000);
 
-  const payload = {
-    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-    contents: [{ role: 'user', parts: [{ text: userMessage }] }],
-    generationConfig: {
-      maxOutputTokens: 3000,
-      responseMimeType: 'application/json'
-    }
-  };
-
   let response;
   let raw;
-
   try {
-    const MAX_ATTEMPTS = 3;
-
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      response = await fetch(
-        'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-goog-api-key': GEMINI_API_KEY
-          },
-          body: JSON.stringify(payload),
-          signal: controller.signal
-        }
-      );
-
-      raw = await response.text();
-
-      if (
-        response.ok ||
-        ![429, 500, 502, 503, 504].includes(response.status) ||
-        attempt === MAX_ATTEMPTS
-      ) {
-        break;
+    response = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': GEMINI_API_KEY
+        },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+          contents: [{ role: 'user', parts: [{ text: userMessage }] }],
+          generationConfig: {
+            maxOutputTokens: 3000,
+            responseMimeType: 'application/json'
+          }
+        }),
+        signal: controller.signal
       }
-
-      await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
-    }
+    );
+    raw = await response.text();
   } catch (err) {
     if (err?.name === 'AbortError') {
       throw new Error('Gemini request timed out after 60 seconds.');
@@ -204,240 +183,64 @@ async function generateInterpretation(question, cards, userName = '') {
     throw new Error(responseData?.error?.message || `Gemini API HTTP ${response.status}`);
   }
 
-  const generatedText = responseData?.candidates?.[0]?.content?.parts
+  const modelText = responseData?.candidates?.[0]?.content?.parts
     ?.filter((part) => typeof part.text === 'string')
     .map((part) => part.text)
-    .join('')
+    .join('\n')
     .trim();
 
-  if (!generatedText) {
+  if (!modelText) {
     const reason = responseData?.candidates?.[0]?.finishReason;
     throw new Error(
-      reason
-        ? `Gemini returned no text (finishReason: ${reason}).`
-        : 'Gemini returned an empty interpretation.'
+      reason ? `Gemini returned no text (finishReason: ${reason}).` : 'Gemini returned an empty response.'
     );
   }
 
-  let result;
+  let parsed;
   try {
-    result = JSON.parse(generatedText);
+    parsed = JSON.parse(modelText);
   } catch {
-    console.error('[tarot-omen] Gemini returned non-JSON interpretation:', generatedText);
-    throw new Error('Gemini returned an invalid interpretation format.');
+    throw new Error('Gemini returned malformed structured output.');
   }
 
-  const interpretation = capText(
-    typeof result?.interpretation === 'string' ? result.interpretation.trim() : '',
-    MAX_INTERPRETATION_CHARS
-  );
-  const voiceInterpretation =
-    typeof result?.voice_interpretation === 'string'
-      ? result.voice_interpretation.trim()
-      : '';
+  const interpretation = typeof parsed?.interpretation === 'string' ? parsed.interpretation.trim() : '';
+  const voiceInterpretation = typeof parsed?.voice_interpretation === 'string'
+    ? parsed.voice_interpretation.trim()
+    : '';
+  const conversationQuestion = typeof parsed?.conversation_question === 'string'
+    ? parsed.conversation_question.trim()
+    : '';
 
-  if (!interpretation) {
-    throw new Error('Gemini returned an empty interpretation.');
+  if (!interpretation || !voiceInterpretation || !conversationQuestion) {
+    throw new Error('Gemini returned incomplete structured output.');
   }
 
-  if (!voiceInterpretation) {
-    throw new Error('Gemini returned an empty voice interpretation.');
-  }
-
-  const conversationQuestion = capText(
-    typeof result?.conversation_question === 'string'
-      ? result.conversation_question.trim()
-      : '',
-    600
-  );
-
-  if (!conversationQuestion) {
-    throw new Error('Gemini returned an empty conversation question.');
-  }
-
-  return { interpretation, voiceInterpretation, conversationQuestion };
+  return {
+    interpretation: capText(interpretation, MAX_INTERPRETATION_CHARS),
+    voice_interpretation: voiceInterpretation,
+    conversation_question: conversationQuestion
+  };
 }
 
-
-async function generateConversationResponse({ userName, originalQuestion, cards, interpretation, history, latestMessage }) {
-  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not configured on the server.');
-
-  const cardBlock = cards.map((c, i) =>
-    `Card ${i + 1} — ${c.position}\nName: ${c.name}\nOrientation: ${c.orientation}\nKeywords: ${c.keywords}`
-  ).join('\n\n');
-
-  const historyBlock = history.length
-    ? history.map((item) => `${item.role === 'user' ? 'User' : 'Omen'}: ${item.text}`).join('\n')
-    : '(no previous conversation messages)';
-
-  const userMessage = `Telegram first name: ${userName || '(not available)'}\n\nOriginal question:\n"${originalQuestion}"\n\nCards from the completed reading:\n${cardBlock}\n\nOriginal interpretation:\n${interpretation}\n\nConversation so far:\n${historyBlock}\n\nLatest user message:\n"${latestMessage}"`;
-
-  // Gemini can occasionally return a transient empty/malformed response even
-  // when the request itself is valid. Retry once before showing an error to the
-  // user. This also prevents a single transient API hiccup from looking like a
-  // broken Omen conversation.
-  let lastError;
-
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 60000);
-
-    let response;
-    let raw;
-
-    try {
-      response = await fetch(
-        'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-goog-api-key': GEMINI_API_KEY
-          },
-          body: JSON.stringify({
-            systemInstruction: { parts: [{ text: CONVERSATION_SYSTEM_PROMPT }] },
-            contents: [{ role: 'user', parts: [{ text: userMessage }] }],
-            generationConfig: {
-              maxOutputTokens: 1200,
-              responseMimeType: 'application/json'
-            }
-          }),
-          signal: controller.signal
-        }
-      );
-      raw = await response.text();
-    } catch (err) {
-      if (err?.name === 'AbortError') {
-        lastError = new Error('Gemini conversation request timed out after 60 seconds.');
-      } else {
-        lastError = err;
-      }
-
-      console.error(`[tarot-omen] Conversation Gemini attempt ${attempt} failed:`, lastError);
-      if (attempt < 2) {
-        await sleep(500);
-        continue;
-      }
-      throw lastError;
-    } finally {
-      clearTimeout(timeout);
-    }
-
-    let data;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      lastError = new Error(`Gemini returned invalid JSON (HTTP ${response.status}).`);
-      console.error(`[tarot-omen] Conversation Gemini attempt ${attempt}:`, lastError, raw?.slice(0, 500));
-      if (attempt < 2) {
-        await sleep(500);
-        continue;
-      }
-      throw lastError;
-    }
-
-    if (!response.ok) {
-      lastError = new Error(data?.error?.message || `Gemini API HTTP ${response.status}`);
-      console.error(`[tarot-omen] Conversation Gemini attempt ${attempt}:`, lastError);
-      if (attempt < 2 && response.status >= 500) {
-        await sleep(500);
-        continue;
-      }
-      throw lastError;
-    }
-
-    const generated = data?.candidates?.[0]?.content?.parts
-      ?.filter((part) => typeof part.text === 'string')
-      .map((part) => part.text)
-      .join('')
-      .trim();
-
-    if (!generated) {
-      lastError = new Error('Gemini returned an empty conversation response.');
-      console.error(`[tarot-omen] Conversation Gemini attempt ${attempt}:`, lastError, {
-        finishReason: data?.candidates?.[0]?.finishReason,
-        promptFeedback: data?.promptFeedback
-      });
-      if (attempt < 2) {
-        await sleep(500);
-        continue;
-      }
-      throw lastError;
-    }
-
-    let result;
-    try {
-      result = JSON.parse(generated);
-    } catch {
-      // Be slightly more tolerant of a model occasionally wrapping JSON in a
-      // markdown fence despite responseMimeType=json.
-      const cleaned = generated
-        .replace(/^```json\s*/i, '')
-        .replace(/^```\s*/i, '')
-        .replace(/\s*```$/i, '')
-        .trim();
-
-      try {
-        result = JSON.parse(cleaned);
-      } catch {
-        lastError = new Error('Gemini returned an invalid conversation format.');
-        console.error(`[tarot-omen] Conversation Gemini attempt ${attempt}:`, lastError, generated.slice(0, 800));
-        if (attempt < 2) {
-          await sleep(500);
-          continue;
-        }
-        throw lastError;
-      }
-    }
-
-    const reply = capText(typeof result?.reply === 'string' ? result.reply.trim() : '', 1800);
-    if (!reply) {
-      lastError = new Error('Gemini returned an empty conversation reply.');
-      console.error(`[tarot-omen] Conversation Gemini attempt ${attempt}:`, lastError, result);
-      if (attempt < 2) {
-        await sleep(500);
-        continue;
-      }
-      throw lastError;
-    }
-
-    return {
-      reply,
-      offerReading: result?.offer_reading === true
-    };
-  }
-
-  throw lastError || new Error('Gemini conversation failed.');
-}
+// ===== /api/interpret — used by the Mini App frontend =====
 
 app.post('/api/interpret', async (req, res) => {
   try {
     const clientKey = req.ip || 'unknown';
-
     if (rateLimited(clientKey)) {
-      return res.status(429).json({
-        error: 'Too many readings requested. Please wait a few minutes.'
-      });
+      return res.status(429).json({ error: 'Too many readings requested. Please wait a few minutes.' });
     }
 
     const body = req.body || {};
-    const question =
-      typeof body.question === 'string'
-        ? body.question.trim()
-        : String(body.question || '').trim();
+    const question = typeof body.question === 'string' ? body.question.trim() : String(body.question || '').trim();
+    const cards = body.cards;
 
-    const result = await generateInterpretation(question, body.cards, '');
-    res.json(result);
+    const result = await generateInterpretation(question, cards);
+    res.json({ interpretation: result.interpretation });
   } catch (err) {
     console.error('[tarot-omen] /api/interpret failed:', err);
-
-    const status = /invalid|required|malformed/i.test(err?.message || '')
-      ? 400
-      : 502;
-
-    res.status(status).json({
-      error: err?.message || 'Something went wrong generating the reading.'
-    });
+    const status = /invalid|required|malformed/i.test(err?.message || '') ? 400 : 502;
+    res.status(status).json({ error: err?.message || 'Something went wrong generating the reading.' });
   }
 });
 
@@ -506,11 +309,8 @@ const TAROT_DECK = [
 
 function drawThreeCards() {
   const shuffled = [...TAROT_DECK].sort(() => Math.random() - 0.5);
-  const positions = [
-    "Ситуация",
-    "Что влияет на ситуацию",
-    "К чему это может привести"
-  ];
+
+  const positions = ["Ситуация", "Что влияет на ситуацию", "К чему это может привести"];
 
   return shuffled.slice(0, 3).map((card, index) => ({
     position: positions[index],
@@ -520,424 +320,168 @@ function drawThreeCards() {
   }));
 }
 
-// ===== LOCAL VISUAL ASSETS =====
-
-const ASSETS_DIR = path.join(__dirname, 'assets');
-const CARDS_DIR = path.join(__dirname, 'cards');
-const SHUFFLE_GIF_PATH = path.join(ASSETS_DIR, 'shuffle.gif');
-const TABLE_PATH = path.join(ASSETS_DIR, 'table.png');
-const ORACLE_IMAGE_PATH = path.join(ASSETS_DIR, 'omen.png');
-
-function cardSlug(name) {
+// Maps a card name to the short image code used for its local file
+// (cards/<code>.jpg). Reused as-is from the earlier working version —
+// same code scheme, just pointed at local files instead of an external URL.
+function tarotImageCode(name) {
   const major = {
-    "Шут": "the_fool",
-    "Маг": "the_magician",
-    "Верховная Жрица": "the_high_priestess",
-    "Императрица": "the_empress",
-    "Император": "the_emperor",
-    "Иерофант": "the_hierophant",
-    "Влюблённые": "the_lovers",
-    "Колесница": "the_chariot",
-    "Сила": "strength",
-    "Отшельник": "the_hermit",
-    "Колесо Фортуны": "wheel_of_fortune",
-    "Справедливость": "justice",
-    "Повешенный": "the_hanged_man",
-    "Смерть": "death",
-    "Умеренность": "temperance",
-    "Дьявол": "the_devil",
-    "Башня": "the_tower",
-    "Звезда": "the_star",
-    "Луна": "the_moon",
-    "Солнце": "the_sun",
-    "Суд": "judgement",
-    "Мир": "the_world"
+    "Шут": "ar00", "Маг": "ar01", "Верховная Жрица": "ar02", "Императрица": "ar03",
+    "Император": "ar04", "Иерофант": "ar05", "Влюблённые": "ar06", "Колесница": "ar07",
+    "Сила": "ar08", "Отшельник": "ar09", "Колесо Фортуны": "ar10", "Справедливость": "ar11",
+    "Повешенный": "ar12", "Смерть": "ar13", "Умеренность": "ar14", "Дьявол": "ar15",
+    "Башня": "ar16", "Звезда": "ar17", "Луна": "ar18", "Солнце": "ar19", "Суд": "ar20", "Мир": "ar21"
   };
 
   if (major[name]) return major[name];
 
-  const parts = name.split(' ');
-  const suit = parts.pop();
-  const rank = parts.join(' ');
-
-  const suitMap = {
-    "Жезлов": "wands",
-    "Кубков": "cups",
-    "Мечей": "swords",
-    "Пентаклей": "pentacles"
-  };
-
+  const suitMap = { "Жезлов": "wa", "Кубков": "cu", "Мечей": "sw", "Пентаклей": "pe" };
   const rankMap = {
-    "Туз": "ace",
-    "Двойка": "two",
-    "Тройка": "three",
-    "Четвёрка": "four",
-    "Пятёрка": "five",
-    "Шестёрка": "six",
-    "Семёрка": "seven",
-    "Восьмёрка": "eight",
-    "Девятка": "nine",
-    "Десятка": "ten",
-    "Паж": "page",
-    "Рыцарь": "knight",
-    "Королева": "queen",
-    "Король": "king"
+    "Туз": "ac", "Паж": "pa", "Рыцарь": "kn", "Королева": "qu", "Король": "ki",
+    "Двойка": "02", "Тройка": "03", "Четвёрка": "04", "Пятёрка": "05",
+    "Шестёрка": "06", "Семёрка": "07", "Восьмёрка": "08", "Девятка": "09", "Десятка": "10"
   };
 
-  return `${rankMap[rank]}_of_${suitMap[suit]}`;
-}
-
-async function cardPathFor(card) {
-  const slug = cardSlug(card.name);
-  const candidates = [
-    path.join(CARDS_DIR, `${slug}.png`),
-    path.join(CARDS_DIR, `${slug}.jpg`),
-    path.join(CARDS_DIR, `${slug}.jpeg`)
-  ];
-
-  for (const candidate of candidates) {
-    try {
-      await readFile(candidate);
-      return candidate;
-    } catch {}
-  }
-
-  throw new Error(`Card image not found for "${card.name}" (${slug}).`);
-}
-
-// Approved layout: left card leans left, center stays straight, right card leans right.
-const CARD_LAYOUT = [
-  { centerX: 275, centerY: 510, angle: -7 },
-  { centerX: 768, centerY: 500, angle: 0 },
-  { centerX: 1260, centerY: 510, angle: 7 }
-];
-
-async function makeCardLayer(card, layout) {
-  const input = await readFile(await cardPathFor(card));
-  const totalRotation =
-    layout.angle + (card.orientation === 'reversed' ? 180 : 0);
-
-  const cardRotated = await sharp(input)
-    .resize({ height: 760, fit: 'contain' })
-    .rotate(totalRotation, {
-      background: { r: 0, g: 0, b: 0, alpha: 0 }
-    })
-    .png()
-    .toBuffer();
-
-  const cardMeta = await sharp(cardRotated).metadata();
-
-  const shadowSvg = Buffer.from(`
-    <svg width="${cardMeta.width}" height="${cardMeta.height}">
-      <rect
-        x="8"
-        y="8"
-        width="${Math.max(1, cardMeta.width - 16)}"
-        height="${Math.max(1, cardMeta.height - 16)}"
-        rx="10"
-        fill="black"
-        fill-opacity="0.32"
-      />
-    </svg>
-  `);
-
-  const shadow = await sharp({
-    create: {
-      width: cardMeta.width,
-      height: cardMeta.height,
-      channels: 4,
-      background: { r: 0, g: 0, b: 0, alpha: 0 }
+  for (const [rank, rankCode] of Object.entries(rankMap)) {
+    for (const [suit, suitCode] of Object.entries(suitMap)) {
+      if (name === `${rank} ${suit}`) return `${suitCode}${rankCode}`;
     }
-  })
-    .composite([{ input: shadowSvg, blend: 'over' }])
-    .blur(12)
-    .png()
-    .toBuffer();
-
-  return { cardRotated, shadow };
-}
-
-async function buildReadingImage(cards) {
-  if (!Array.isArray(cards) || cards.length !== 3) {
-    throw new Error('Exactly three cards are required to build the spread image.');
   }
 
-  await readFile(TABLE_PATH);
-
-  const layers = await Promise.all(
-    cards.map((card, index) => makeCardLayer(card, CARD_LAYOUT[index]))
-  );
-
-  const composites = [];
-
-  // Back cards first, center card last so the overlap matches the approved image.
-  const order = [0, 2, 1];
-
-  for (const index of order) {
-    const layout = CARD_LAYOUT[index];
-    const { cardRotated, shadow } = layers[index];
-
-    const cardMeta = await sharp(cardRotated).metadata();
-    const shadowMeta = await sharp(shadow).metadata();
-
-    composites.push({
-      input: shadow,
-      left: Math.round(layout.centerX - shadowMeta.width / 2 + 10),
-      top: Math.round(layout.centerY - shadowMeta.height / 2 + 10)
-    });
-
-    composites.push({
-      input: cardRotated,
-      left: Math.round(layout.centerX - cardMeta.width / 2),
-      top: Math.round(layout.centerY - cardMeta.height / 2)
-    });
-  }
-
-  return sharp(TABLE_PATH)
-    .ensureAlpha()
-    .composite(composites)
-    .png()
-    .toBuffer();
+  return null;
 }
 
-// ===== CONVERSATION SESSIONS =====
-// MVP storage: in-memory. A Render restart clears these sessions; persistent
-// conversation/payment storage can be added later without changing the reading logic.
-const sessions = new Map();
-const FREE_CONVERSATION_LIMIT = 3;
-// Voice is NOT part of the free conversation. It is generated only for the
-// initial free reading and for subsequent readings after paid continuation is
-// granted by the future payment flow.
-const PAID_CONTINUATION_DEFAULT = false;
-
-// ===== TELEGRAM =====
+// ===== TELEGRAM BOT (webhook mode — no polling, no getUpdates loop) =====
+//
+// Render restarts/redeploys can briefly run two instances of the process.
+// Long-polling (getUpdates) breaks in that situation with a 409 Conflict,
+// because Telegram only allows one active getUpdates consumer per bot.
+// A webhook has no such problem: Telegram just POSTs each update to this
+// URL, and only whichever instance is currently live receives it.
 
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
-const TELEGRAM_CHUNK_SIZE = 3500;
-const CARDS_CAPTION = 'Вот какие карты выпали и вот что я по ним вижу';
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+const TELEGRAM_MESSAGE_LIMIT = 4096;
+const TELEGRAM_CHUNK_SIZE = 3500; // safety margin under the 4096 hard limit
 
 function splitForTelegram(text, maxLen = TELEGRAM_CHUNK_SIZE) {
   if (text.length <= maxLen) return [text];
 
   const chunks = [];
   let start = 0;
-
   while (start < text.length) {
     let end = Math.min(start + maxLen, text.length);
-
     if (end < text.length) {
       const window = text.slice(start, end);
-      const breakAt = Math.max(
-        window.lastIndexOf('\n\n'),
-        window.lastIndexOf('\n'),
-        window.lastIndexOf(' ')
-      );
-
+      const breakAt = Math.max(window.lastIndexOf('\n\n'), window.lastIndexOf('\n'), window.lastIndexOf(' '));
       if (breakAt > maxLen * 0.5) {
         end = start + breakAt;
       }
     }
-
     const chunk = text.slice(start, end).trim();
-
-    if (chunk) {
-      chunks.push(chunk);
-    }
-
+    if (chunk) chunks.push(chunk);
     start = end;
   }
-
   return chunks;
 }
 
-async function telegramSendMessage(chatId, text, returnMessageIds = false) {
-  const messageIds = [];
-
-  for (const part of splitForTelegram(text)) {
+async function telegramSendMessage(chatId, text) {
+  const parts = splitForTelegram(text);
+  for (const part of parts) {
     const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: part
-      })
+      body: JSON.stringify({ chat_id: chatId, text: part })
     });
-
     if (!response.ok) {
-      throw new Error(`Telegram sendMessage failed: ${await response.text()}`);
+      const errBody = await response.text();
+      throw new Error(`Telegram sendMessage failed: ${errBody}`);
     }
-
-    if (returnMessageIds) {
-      const data = await response.json();
-      if (data.ok && data.result?.message_id) {
-        messageIds.push(data.result.message_id);
-      }
-    }
-  }
-
-  return returnMessageIds ? messageIds : undefined;
-}
-
-async function telegramSendOracle(chatId) {
-  const imageBuffer = await readFile(ORACLE_IMAGE_PATH);
-
-  const form = new FormData();
-  form.append(
-    'chat_id',
-    String(chatId)
-  );
-  form.append(
-    'photo',
-    new Blob([imageBuffer], { type: 'image/png' }),
-    'omen.png'
-  );
-
-  const response = await fetch(`${TELEGRAM_API}/sendPhoto`, {
-    method: 'POST',
-    body: form
-  });
-
-  if (!response.ok) {
-    throw new Error(`Telegram sendPhoto (oracle) failed: ${await response.text()}`);
   }
 }
 
+// Sends shuffle.gif as a real Telegram animation (local file, multipart —
+// never an external URL). If the file isn't present yet in the repo, this
+// logs a warning and falls back to a plain text message instead of failing
+// the whole flow, so the bot keeps working even before the asset is added.
 async function telegramSendShuffleGif(chatId) {
-  const gifBuffer = await readFile(SHUFFLE_GIF_PATH);
+  let gifBuffer;
+  try {
+    gifBuffer = await readFile(SHUFFLE_GIF_PATH);
+  } catch {
+    console.warn(`[tarot-omen] shuffle.gif not found at ${SHUFFLE_GIF_PATH}, sending text instead.`);
+    await telegramSendMessage(chatId, '🔮 Перемешиваю карты...');
+    return;
+  }
 
   const form = new FormData();
   form.append('chat_id', String(chatId));
-  form.append(
-    'animation',
-    new Blob([gifBuffer], { type: 'image/gif' }),
-    'shuffle.gif'
-  );
+  form.append('animation', new Blob([gifBuffer], { type: 'image/gif' }), 'shuffle.gif');
+  form.append('caption', '🔮 Перемешиваю карты...');
 
-  const response = await fetch(`${TELEGRAM_API}/sendAnimation`, {
-    method: 'POST',
-    body: form
-  });
-
+  const response = await fetch(`${TELEGRAM_API}/sendAnimation`, { method: 'POST', body: form });
   if (!response.ok) {
-    throw new Error(`Telegram sendAnimation failed: ${await response.text()}`);
-  }
-
-  const data = await response.json();
-
-  if (!data.ok || !data.result?.message_id) {
-    throw new Error('Telegram sendAnimation returned no message_id.');
-  }
-
-  return data.result.message_id;
-}
-
-async function telegramDeleteMessage(chatId, messageId) {
-  if (!messageId) return;
-
-  const response = await fetch(`${TELEGRAM_API}/deleteMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatId,
-      message_id: messageId
-    })
-  });
-
-  if (!response.ok) {
-    console.warn(
-      `[tarot-omen] deleteMessage failed: ${await response.text()}`
-    );
+    console.warn(`[tarot-omen] sendAnimation failed: ${await response.text()}`);
+    await telegramSendMessage(chatId, '🔮 Перемешиваю карты...');
   }
 }
 
-async function telegramSendSpreadImage(chatId, imageBuffer) {
-  const form = new FormData();
-  form.append('chat_id', String(chatId));
-  form.append(
-    'photo',
-    new Blob([imageBuffer], { type: 'image/png' }),
-    'tarot-spread.png'
-  );
-
-  const response = await fetch(`${TELEGRAM_API}/sendPhoto`, {
-    method: 'POST',
-    body: form
-  });
-
-  if (!response.ok) {
-    throw new Error(`Telegram sendPhoto (spread) failed: ${await response.text()}`);
-  }
-}
-
-async function elevenLabsTextToSpeech(text) {
-  if (!ELEVENLABS_API_KEY || !OMEN_VOICE_ID) {
-    return null;
-  }
-
-  const response = await fetch(
-    `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(OMEN_VOICE_ID)}?output_format=mp3_44100_128`,
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'xi-api-key': ELEVENLABS_API_KEY
-      },
-      body: JSON.stringify({
-        text,
-        model_id: 'eleven_v3'
+// Sends the three drawn cards as local photo files (never external URLs —
+// that previously caused WEBPAGE_CURL_FAILED). If a local image is missing
+// for any of the three cards, falls back to a plain text summary of the
+// same three cards so the reading can still proceed.
+async function telegramSendCardsLocal(chatId, cards) {
+  try {
+    const attachments = await Promise.all(
+      cards.map(async (card, i) => {
+        const code = tarotImageCode(card.name);
+        if (!code) throw new Error(`No image code for card: ${card.name}`);
+        const filePath = path.join(CARDS_DIR, `${code}.jpg`);
+        const buffer = await readFile(filePath);
+        const orientation = card.orientation === 'reversed' ? 'перевёрнутая' : 'прямая';
+        return {
+          fieldName: `card${i}`,
+          buffer,
+          caption: `${i + 1}. ${card.name}\n${orientation}\n${card.position}`
+        };
       })
+    );
+
+    const media = attachments.map((a) => ({
+      type: 'photo',
+      media: `attach://${a.fieldName}`,
+      caption: a.caption
+    }));
+
+    const form = new FormData();
+    form.append('chat_id', String(chatId));
+    form.append('media', JSON.stringify(media));
+    for (const a of attachments) {
+      form.append(a.fieldName, new Blob([a.buffer], { type: 'image/jpeg' }), `${a.fieldName}.jpg`);
     }
-  );
 
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`ElevenLabs TTS failed: ${body}`);
-  }
-
-  return Buffer.from(await response.arrayBuffer());
-}
-
-async function telegramSendVoice(chatId, audioBuffer) {
-  if (!audioBuffer) return;
-
-  const form = new FormData();
-  form.append('chat_id', String(chatId));
-  form.append(
-    'voice',
-    new Blob([audioBuffer], { type: 'audio/mpeg' }),
-    'omen.mp3'
-  );
-
-  const response = await fetch(`${TELEGRAM_API}/sendVoice`, {
-    method: 'POST',
-    body: form
-  });
-
-  if (!response.ok) {
-    throw new Error(`Telegram sendVoice failed: ${await response.text()}`);
+    const response = await fetch(`${TELEGRAM_API}/sendMediaGroup`, { method: 'POST', body: form });
+    if (!response.ok) {
+      throw new Error(`Telegram sendMediaGroup failed: ${await response.text()}`);
+    }
+  } catch (err) {
+    console.warn('[tarot-omen] Falling back to text cards (no local images found):', err?.message || err);
+    const summary = cards
+      .map((c, i) => {
+        const orientation = c.orientation === 'reversed' ? 'перевёрнутая' : 'прямая';
+        return `${i + 1}. ${c.name} (${orientation}) — ${c.position}`;
+      })
+      .join('\n');
+    await telegramSendMessage(chatId, `🃏 Выпавшие карты:\n\n${summary}`);
   }
 }
 
 async function handleTelegramUpdate(update) {
   const message = update?.message;
-  if (!message) return;
-
-  // Voice/audio input is intentionally NOT supported. We do not call ElevenLabs STT,
-  // so user voice messages never consume ElevenLabs credits.
-  if (!message.text) return;
+  if (!message || !message.text) return;
 
   const chatId = message.chat.id;
   const text = String(message.text || '').trim();
-  const userName = String(message.from?.first_name || '').trim();
-
-  if (!text) return;
 
   if (text === '/start') {
-    sessions.delete(chatId);
     await telegramSendMessage(chatId, 'Задавай свой вопрос');
     return;
   }
@@ -947,159 +491,58 @@ async function handleTelegramUpdate(update) {
     return;
   }
 
-  const session = sessions.get(chatId);
-
-  // ===== FREE CONVERSATION AFTER A COMPLETED READING =====
-  if (session?.reading && session.freeConversationUsed < FREE_CONVERSATION_LIMIT) {
-    try {
-      const result = await generateConversationResponse({
-        userName,
-        originalQuestion: session.reading.question,
-        cards: session.reading.cards,
-        interpretation: session.reading.interpretation,
-        history: session.history,
-        latestMessage: text
-      });
-
-      session.freeConversationUsed += 1;
-      session.history.push({ role: 'user', text });
-      session.history.push({ role: 'omen', text: result.reply });
-
-      // IMPORTANT: free conversation is text-only. ElevenLabs is never called
-      // for these follow-up messages. Voice becomes available only after a paid
-      // continuation is granted, and then only when a new Tarot spread is made.
-      await telegramSendMessage(chatId, result.reply);
-
-      if (result.offerReading) {
-        session.readingOfferShown = true;
-      }
-
-      // The third free message is the end of the free conversation window.
-      if (session.freeConversationUsed >= FREE_CONVERSATION_LIMIT && !result.offerReading) {
-        await telegramSendMessage(
-          chatId,
-          'Мне кажется, здесь уже появился отдельный вопрос. Если захочешь, можем посмотреть на него глубже.'
-        );
-      }
-
-      return;
-    } catch (err) {
-      console.error('[tarot-omen] Telegram conversation error:', err);
-      await telegramSendMessage(chatId, 'Не смог сейчас продолжить мысль. Попробуй ещё раз.');
-      return;
-    }
-  }
-
-  // After the free conversation window we do not generate more free AI replies.
-  // Paid continuation/payment flow will be connected separately.
-  if (session?.reading && session.freeConversationUsed >= FREE_CONVERSATION_LIMIT) {
-    await telegramSendMessage(
-      chatId,
-      'Если чувствуешь, что здесь хочется пойти дальше, можем посмотреть этот вопрос отдельным раскладом.'
-    );
-    return;
-  }
-
   try {
-    // ===== NEW FREE THREE-CARD READING =====
+    // Cards are drawn exactly once here — this same array is what gets shown
+    // to the user AND what gets sent to Gemini, so they can never diverge.
     const cards = drawThreeCards();
 
-    const mixingMessageIds = await telegramSendMessage(chatId, 'Мешаю карты...', true);
-    const shuffleMessageId = await telegramSendShuffleGif(chatId);
+    // 1) Shuffle GIF first, immediately — before the (slow) Gemini call —
+    //    so the user isn't staring at an empty chat.
+    await telegramSendShuffleGif(chatId);
 
-    const interpretationPromise = generateInterpretation(text, cards, userName);
-    const spreadImagePromise = buildReadingImage(cards);
-    const spreadImage = await spreadImagePromise;
+    // 2) Reveal the three actual cards right away.
+    await telegramSendCardsLocal(chatId, cards);
 
-    await telegramSendSpreadImage(chatId, spreadImage);
+    // 3) Only now call Gemini, with that exact same cards array.
+    const result = await generateInterpretation(text, cards);
 
-    for (const messageId of mixingMessageIds || []) {
-      await telegramDeleteMessage(chatId, messageId);
-    }
-    await telegramDeleteMessage(chatId, shuffleMessageId);
+    // 4) Interpretation goes out last.
+    await telegramSendMessage(chatId, `🔮 Интерпретация\n\n${result.interpretation}`);
 
-    await telegramSendMessage(chatId, CARDS_CAPTION);
-    await sleep(2000);
-
-    const result = await interpretationPromise;
-
-    // Voice entitlement: the first reading is free and includes voice.
-    // Any later reading must have paidContinuation=true. Free conversation
-    // messages never reach ElevenLabs.
-    const includeVoice = !session || session.paidContinuation === true;
-
-    if (includeVoice) {
-      try {
-        const voiceBuffer = await elevenLabsTextToSpeech(result.voiceInterpretation);
-        if (voiceBuffer) await telegramSendVoice(chatId, voiceBuffer);
-      } catch (voiceErr) {
-        console.error('[tarot-omen] Reading voice generation failed; continuing with text:', voiceErr);
-      }
-    }
-
-    await telegramSendMessage(chatId, result.interpretation);
-
-    // Every completed reading ends with one separate, context-aware question.
-    // It is generated together with the interpretation, so it does not create
-    // an extra Gemini request. This question is conversation-only: it never
-    // mentions payment or tries to sell a new spread.
-    await telegramSendMessage(chatId, result.conversationQuestion);
-
-    sessions.set(chatId, {
-      userName,
-      reading: {
-        question: text,
-        cards,
-        interpretation: result.interpretation
-      },
-      history: [
-        { role: 'omen', text: result.conversationQuestion }
-      ],
-      freeConversationUsed: 0,
-      paidContinuation: PAID_CONTINUATION_DEFAULT,
-      readingOfferShown: false
-    });
+    // 5) Continue the conversation with a context-specific question.
+    await telegramSendMessage(chatId, result.conversation_question);
   } catch (err) {
-    console.error('[tarot-omen] Telegram reading error:', err);
-
+    console.error('Telegram interpretation error:', err);
     try {
-      await telegramSendMessage(chatId, 'Не удалось получить расклад. Попробуй ещё раз.');
+      await telegramSendMessage(chatId, 'Не удалось получить интерпретацию. Попробуй ещё раз.');
     } catch (sendErr) {
-      console.error('[tarot-omen] Telegram: failed to send error message:', sendErr);
+      console.error('Telegram: failed to even send the error message:', sendErr);
     }
   }
 }
 
 app.post('/telegram-webhook', (req, res) => {
+  // Acknowledge immediately so Telegram doesn't time out and retry the same
+  // update while we're still waiting on Gemini.
   res.sendStatus(200);
-
   handleTelegramUpdate(req.body).catch((err) => {
-    console.error('[tarot-omen] Telegram webhook handler error:', err);
+    console.error('Telegram webhook handler error:', err);
   });
 });
 
 async function setupTelegramWebhook() {
   if (!TELEGRAM_BOT_TOKEN) return;
-
   try {
     const response = await fetch(`${TELEGRAM_API}/setWebhook`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        url: TELEGRAM_WEBHOOK_URL,
-        drop_pending_updates: true
-      })
+      body: JSON.stringify({ url: TELEGRAM_WEBHOOK_URL, drop_pending_updates: true })
     });
-
     const data = await response.json();
-
     if (!data.ok) {
       console.error('[tarot-omen] setWebhook failed:', data);
     } else {
-      console.log(
-        '[tarot-omen] Telegram webhook set to',
-        TELEGRAM_WEBHOOK_URL
-      );
+      console.log('[tarot-omen] Telegram webhook set to', TELEGRAM_WEBHOOK_URL);
     }
   } catch (err) {
     console.error('[tarot-omen] setWebhook error:', err);
