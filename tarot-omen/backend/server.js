@@ -88,7 +88,8 @@ For every spread:
 - If the question concerns money or finance: never promise a financial outcome.
 - Reply in the same language the user's question is written in.
 - Length: about 4 short paragraphs for three cards; about 7 short paragraphs for the Celtic Cross.
-- No headers, no bullet lists, no card-by-card labels — a flowing reading.
+- For the Celtic Cross, explicitly connect the interpretation to the meaning of each position and name the position when it helps clarity. Do not treat the 10 cards as a generic list of meanings.
+- Keep the interpretation flowing and personal rather than turning it into a dry catalogue.
 
 Return ONLY valid JSON with exactly one string field:
 {"interpretation":"..."}`;
@@ -380,27 +381,41 @@ function drawThreeCards() {
 }
 
 
+const CELTIC_POSITIONS = [
+  { name: 'Ситуация', meaning: 'что происходит с тобой сейчас и в каком состоянии находится вопрос' },
+  { name: 'Что пересекает ситуацию', meaning: 'главный фактор, препятствие или влияние, которое вмешивается в ситуацию' },
+  { name: 'Основание ситуации', meaning: 'глубинная причина, фундамент или то, на чём всё держится' },
+  { name: 'Недавнее прошлое', meaning: 'события недавнего прошлого, которые привели к нынешней ситуации' },
+  { name: 'Сознательная цель', meaning: 'чего ты сознательно хочешь, к чему стремишься или что держишь в фокусе' },
+  { name: 'Ближайшее будущее', meaning: 'тенденция ближайшего развития ситуации' },
+  { name: 'Сам человек', meaning: 'твоя внутренняя позиция, состояние и способ воспринимать происходящее' },
+  { name: 'Внешнее окружение', meaning: 'люди, обстоятельства и внешние факторы, влияющие на ситуацию' },
+  { name: 'Надежды и опасения', meaning: 'чего ты надеешься получить и чего одновременно опасаешься' },
+  { name: 'Итог', meaning: 'к чему ведёт текущая совокупность факторов и какова вероятная тенденция' }
+];
+
 function drawCelticCrossCards() {
   const shuffled = [...TAROT_DECK].sort(() => Math.random() - 0.5);
-  const positions = [
-    'Ситуация',
-    'Что пересекает ситуацию',
-    'Основание ситуации',
-    'Недавнее прошлое',
-    'Сознательная цель',
-    'Ближайшее будущее',
-    'Сам человек',
-    'Внешнее окружение',
-    'Надежды и опасения',
-    'Итог'
-  ];
 
   return shuffled.slice(0, 10).map((card, index) => ({
-    position: positions[index],
+    position: CELTIC_POSITIONS[index].name,
+    positionMeaning: CELTIC_POSITIONS[index].meaning,
     name: card.name,
     orientation: Math.random() < 0.5 ? 'upright' : 'reversed',
     keywords: card.keywords
   }));
+}
+
+function formatCelticCardMap(cards) {
+  return [
+    '🃏 Значение позиций Кельтского креста:',
+    '',
+    ...cards.map((card, index) => {
+      const orientation = card.orientation === 'reversed' ? 'перевёрнутая' : 'прямая';
+      const position = CELTIC_POSITIONS[index] || { name: card.position, meaning: card.positionMeaning || '' };
+      return `${index + 1}. ${position.name} — ${card.name} (${orientation})\n${position.meaning}`;
+    })
+  ].join('\n');
 }
 
 // ===== LOCAL VISUAL ASSETS =====
@@ -1451,7 +1466,7 @@ async function runPaidCelticReading(chatId, session, question) {
     for (const messageId of mixingMessageIds || []) await telegramDeleteMessage(chatId, messageId);
     await telegramDeleteMessage(chatId, shuffleMessageId);
 
-    await telegramSendMessage(chatId, 'Вот какие карты выпали в Кельтском кресте и вот что я по ним вижу');
+    await telegramSendMessage(chatId, formatCelticCardMap(cards));
     await sleep(1500);
 
     const result = await interpretationPromise;
