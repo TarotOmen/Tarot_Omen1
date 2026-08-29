@@ -1553,6 +1553,39 @@ async function runPaidThreeCardReading(chatId, session, question) {
   }
 }
 
+async function sendStartMessage(chatId) {
+  const replyMarkup = {
+    inline_keyboard: [
+      [{ text: '🃏 Тест Кельтского креста — бесплатно', callback_data: 'test:celtic' }]
+    ]
+  };
+  const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text: 'Задавай свой вопрос', reply_markup: replyMarkup })
+  });
+  if (!response.ok) {
+    throw new Error(`Telegram start message failed: ${await response.text()}`);
+  }
+}
+
+async function runFreeTestCelticReading(chatId, session) {
+  if (!session) {
+    throw new Error('Сначала нужен расклад.');
+  }
+
+  const question =
+    session.pendingReadingQuestion ||
+    session.reading?.question ||
+    'Что мне важно увидеть сейчас?';
+
+  await telegramSendMessage(
+    chatId,
+    '🧪 Тестовый запуск Кельтского креста — бесплатно. В обычном режиме здесь будет оплата.'
+  );
+  await runPaidCelticReading(chatId, session, question);
+}
+
 async function handleTelegramUpdate(update) {
   if (update?.pre_checkout_query) {
     try {
@@ -1573,7 +1606,9 @@ async function handleTelegramUpdate(update) {
     const chatId = callback.message?.chat?.id;
     const session = sessions.get(chatId);
     try {
-      if (callback.data === 'pay:stars:reading') {
+      if (callback.data === 'test:celtic') {
+        await runFreeTestCelticReading(chatId, session);
+      } else if (callback.data === 'pay:stars:reading') {
         await createPaymentInvoice(chatId, session, 'reading', 'STARS');
       } else if (callback.data === 'pay:stars:celtic') {
         await createPaymentInvoice(chatId, session, 'celtic', 'STARS');
@@ -1669,7 +1704,19 @@ async function handleTelegramUpdate(update) {
     } else {
       sessions.get(chatId).userName = userName || sessions.get(chatId).userName || '';
     }
-    await telegramSendMessage(chatId, 'Задавай свой вопрос');
+    await sendStartMessage(chatId);
+    return;
+  }
+
+  // TEMPORARY TEST MODE: remove this command and the test button before public launch.
+  if (text === '/testceltic') {
+    const currentSession = sessions.get(chatId);
+    try {
+      await runFreeTestCelticReading(chatId, currentSession);
+    } catch (err) {
+      console.error('[tarot-omen] Free Celtic test failed:', err);
+      await telegramSendMessage(chatId, 'Не удалось запустить тестовый Кельтский крест.');
+    }
     return;
   }
 
