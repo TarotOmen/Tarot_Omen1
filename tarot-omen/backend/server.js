@@ -56,73 +56,59 @@ function capText(text, maxLen) {
   return text.slice(0, cut).trim() + '…';
 }
 
-// ===== OMEN DIALOGUE STATE =====
-// The current MVP keeps the active conversation in memory. A persistent store can be
-// added later when payments/accounts are connected.
-const OMEN_FREE_DIALOGUE_MESSAGES = 3;
-const omenSessions = new Map();
+const SYSTEM_PROMPT = `You are Omen, a thoughtful Tarot reader and conversational companion.
 
-function createOmenSession() {
-  return {
-    hasFreeReading: false,
-    initialQuestion: '',
-    initialCards: null,
-    initialInterpretation: '',
-    dialogueMessagesUsed: 0,
-    conversation: [],
-    pendingPaidReading: false
-  };
-}
+You speak with one person in a personal, natural way. Use the person's Telegram first name only when it feels natural. Never assume or mention the person's gender. In Russian and other languages, prefer constructions that remain natural without gendered assumptions. Do not address the user as a woman or as a man unless the user explicitly states their gender.
 
-function getOmenSession(chatId) {
-  if (!omenSessions.has(chatId)) {
-    omenSessions.set(chatId, createOmenSession());
-  }
-  return omenSessions.get(chatId);
-}
-
-const SYSTEM_PROMPT = `You are the reading voice of Tarot Omen, a Tarot mini app.
-
-You receive: a user's question, and three already-drawn Tarot cards (each with its
-position, name, and orientation — upright or reversed). The cards were chosen by a
-random generator before you were called. You never choose or invent cards.
+For a three-card reading you receive a user's question and three already-drawn Tarot cards. The cards were chosen by a random generator before you were called. You never choose or invent cards.
 
 Produce TWO versions of the SAME interpretation:
 
-1) "interpretation": the full text reading.
-- Write one unified, personal interpretation of the spread AS IT RELATES TO THE
-  QUESTION — not a generic listing of card meanings.
-- Read each card in light of its position (The Situation / What Influences It /
-  Where It May Lead) and its orientation.
+1) \"interpretation\": the full text reading.
+- Write one unified, personal interpretation of the spread AS IT RELATES TO THE QUESTION — not a generic listing of card meanings.
+- Read each card in light of its position (The Situation / What Influences It / Where It May Lead) and its orientation.
 - Weave the three cards into one coherent narrative, noting how they interact.
 - Be specific to the question's actual topic and phrasing.
 - Keep language reflective and open. Never claim certainty about the future.
-- If the question concerns health: never diagnose. Offer only reflective
-  interpretation and gently recommend a qualified professional when appropriate.
+- If the question concerns health: never diagnose. Offer only reflective interpretation and gently recommend a qualified professional when appropriate.
 - If the question concerns money or finance: never promise a financial outcome.
-- Reply in the same language the user's question is written in.
-- Length: about 4 short paragraphs. No headers, no bullet lists, no card-by-card
-  labels — a flowing reading.
+- Reply in the same language as the user's question.
+- Length: about 4 short paragraphs. No headers, no bullet lists, no card-by-card labels.
 
-2) "voice_interpretation": a SHORT spoken version of the same reading for Omen's
-  voice message.
-- It must communicate the most important insight from the full interpretation,
-  not introduce a different meaning.
+2) \"voice_interpretation\": a SHORT spoken version of the same reading for Omen's voice message.
 - 2 to 4 natural spoken sentences, roughly 180-450 characters when possible.
 - Sound like Omen is personally speaking to one person, not reading an article.
 - Calm, intimate, confident and slightly mysterious, but natural.
-- Use natural pauses and conversational phrasing.
-- Do not say "I will explain", "in the full interpretation", "the cards below",
-  or anything that refers to the text itself.
-- Do not list all three cards mechanically. Choose the most important thread
-  or insight from their interaction.
-- Do not give direct instructions or tell the user what they must do.
-- Reply in the same language as the user's question.
+- Never use gendered wording about the user when it can be avoided.
+- Do not mechanically list all three cards.
 
 Return ONLY valid JSON with exactly these two string fields:
-{"interpretation":"...","voice_interpretation":"..."}`;
+{\"interpretation\":\"...\",\"voice_interpretation\":\"...\"}`;
 
-async function generateInterpretation(question, cards) {
+const CONVERSATION_SYSTEM_PROMPT = `You are Omen, the same Tarot reader who has just completed a three-card reading with the user. You are now having a short, personal conversation about that reading.
+
+Your job is NOT to generate another Tarot reading and NOT to sell anything. Listen to what the person says, understand the new context, and respond like a perceptive human Tarot reader.
+
+Rules:
+- Use the conversation history and the original reading as context.
+- Answer the user's latest message directly.
+- Keep the conversation natural, warm, concise and personal. Usually 1-3 short paragraphs.
+- Ask a useful follow-up question when it genuinely helps reveal what is bothering the person. Do not ask a question mechanically every time.
+- Do not invent facts about the user's life.
+- Never claim certainty about the future.
+- If health is involved, never diagnose. If appropriate, recommend a qualified professional.
+- If money or finance is involved, never promise a financial outcome.
+- Never assume or mention the user's gender. Prefer gender-neutral wording.
+- Use the Telegram first name only if it sounds natural.
+- Do NOT suggest another Tarot spread merely because a message-count limit has been reached.
+- When a genuinely new layer or question appears that would benefit from cards, you may gently suggest looking at that specific question with a separate spread. The suggestion must feel like a natural continuation of the conversation, never like a sales pitch. Avoid phrases such as \"это будет платное продолжение\", \"купи\", \"оплати\" or \"у тебя закончились бесплатные сообщения\".
+- A good invitation sounds like: \"Теперь я понимаю, что здесь задевает тебя сильнее всего. Если хочешь, можем посмотреть именно на это отдельным раскладом.\"
+- If there is no genuinely new question, simply continue the conversation.
+
+Return ONLY valid JSON with exactly these two string fields:
+{\"reply\":\"...\",\"offer_reading\":false}`;
+
+async function generateInterpretation(question, cards, userName = '') {
   if (!GEMINI_API_KEY) {
     throw new Error('GEMINI_API_KEY is not configured on the server.');
   }
@@ -151,7 +137,7 @@ async function generateInterpretation(question, cards) {
     )
     .join('\n\n');
 
-  const userMessage = `User's question:\n"${question.trim()}"\n\nDrawn spread:\n\n${cardBlock}`;
+  const userMessage = `Telegram first name: ${userName || '(not available)'}\nUse the first name only if it sounds natural. Never infer gender.\n\nUser's question:\n"${question.trim()}"\n\nDrawn spread:\n\n${cardBlock}`;
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 60000);
@@ -173,7 +159,7 @@ async function generateInterpretation(question, cards) {
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       response = await fetch(
-        'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent',
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent',
         {
           method: 'POST',
           headers: {
@@ -261,156 +247,75 @@ async function generateInterpretation(question, cards) {
   return { interpretation, voiceInterpretation };
 }
 
-const CONVERSATION_SYSTEM_PROMPT = `You are Omen, a Tarot reader and thoughtful conversational guide.
 
-The user has already received a free three-card Tarot reading. Your task now is to continue a natural conversation about THAT reading and the user's situation.
+async function generateConversationResponse({ userName, originalQuestion, cards, interpretation, history, latestMessage }) {
+  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not configured on the server.');
 
-Rules:
-- Use the original question, the drawn cards, the original interpretation, and the conversation history.
-- Do not draw cards, invent cards, or pretend a new reading has happened.
-- Do not repeat the full original reading. Refer to it naturally when useful.
-- Be attentive to what the user actually says. The goal is to understand the real issue behind the original question.
-- Ask a useful, natural follow-up question when it helps uncover a meaningful new layer.
-- Do not force a sale and do not mention credits, prices, payment, subscriptions, limits, monetization, or being an AI.
-- A new Tarot reading should be suggested ONLY when the conversation has uncovered a genuinely new question or layer that would benefit from looking at the cards.
-- If the user's message is simply a closing/thank-you, respond naturally and do not suggest another reading.
-- If the user is discussing health, never diagnose; keep the Tarot interpretation reflective and recommend a qualified professional when appropriate.
-- If the user is discussing money or finance, never promise a financial outcome.
-- Reply in the same language as the user.
-- Keep the response concise: normally 2-4 short paragraphs.
+  const cardBlock = cards.map((c, i) =>
+    `Card ${i + 1} — ${c.position}\nName: ${c.name}\nOrientation: ${c.orientation}\nKeywords: ${c.keywords}`
+  ).join('\n\n');
 
-Return ONLY valid JSON with exactly these two fields:
-{"reply":"...","offer_new_reading":false}
+  const historyBlock = history.length
+    ? history.map((item) => `${item.role === 'user' ? 'User' : 'Omen'}: ${item.text}`).join('\n')
+    : '(no previous conversation messages)';
 
-Set offer_new_reading=true only when there is a specific new question worth exploring with a fresh Tarot spread. Otherwise set it to false.`;
-
-async function generateConversationReply(session, userMessage) {
-  if (!GEMINI_API_KEY) {
-    throw new Error('GEMINI_API_KEY is not configured on the server.');
-  }
-
-  const history = session.conversation
-    .slice(-8)
-    .map((item) => `${item.role === 'user' ? 'User' : 'Omen'}: ${item.text}`)
-    .join('\n');
-
-  const cardsText = Array.isArray(session.initialCards)
-    ? session.initialCards
-        .map(
-          (c, i) =>
-            `Card ${i + 1} — ${c.position}; ${c.name}; ${c.orientation}; Keywords: ${c.keywords}`
-        )
-        .join('\n')
-    : 'No cards available.';
-
-  const userMessageForGemini = `Original user question:
-${session.initialQuestion}
-
-Original three-card spread:
-${cardsText}
-
-Original interpretation:
-${session.initialInterpretation}
-
-Conversation so far:
-${history || '(none)'}
-
-New user message:
-${userMessage}`;
+  const userMessage = `Telegram first name: ${userName || '(not available)'}\n\nOriginal question:\n"${originalQuestion}"\n\nCards from the completed reading:\n${cardBlock}\n\nOriginal interpretation:\n${interpretation}\n\nConversation so far:\n${historyBlock}\n\nLatest user message:\n"${latestMessage}"`;
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 60000);
 
-  const payload = {
-    systemInstruction: { parts: [{ text: CONVERSATION_SYSTEM_PROMPT }] },
-    contents: [{ role: 'user', parts: [{ text: userMessageForGemini }] }],
-    generationConfig: {
-      maxOutputTokens: 1200,
-      responseMimeType: 'application/json'
-    }
-  };
-
   let response;
   let raw;
-
   try {
-    const MAX_ATTEMPTS = 3;
-
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      response = await fetch(
-        'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-goog-api-key': GEMINI_API_KEY
-          },
-          body: JSON.stringify(payload),
-          signal: controller.signal
-        }
-      );
-
-      raw = await response.text();
-
-      if (
-        response.ok ||
-        ![429, 500, 502, 503, 504].includes(response.status) ||
-        attempt === MAX_ATTEMPTS
-      ) {
-        break;
+    response = await fetch(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': GEMINI_API_KEY
+        },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: CONVERSATION_SYSTEM_PROMPT }] },
+          contents: [{ role: 'user', parts: [{ text: userMessage }] }],
+          generationConfig: {
+            maxOutputTokens: 1200,
+            responseMimeType: 'application/json'
+          }
+        }),
+        signal: controller.signal
       }
-
-      await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
-    }
+    );
+    raw = await response.text();
   } catch (err) {
-    if (err?.name === 'AbortError') {
-      throw new Error('Gemini conversation request timed out after 60 seconds.');
-    }
+    if (err?.name === 'AbortError') throw new Error('Gemini conversation request timed out after 60 seconds.');
     throw err;
   } finally {
     clearTimeout(timeout);
   }
 
-  let responseData;
-  try {
-    responseData = JSON.parse(raw);
-  } catch {
-    throw new Error(`Gemini returned invalid JSON (HTTP ${response.status}).`);
-  }
+  let data;
+  try { data = JSON.parse(raw); }
+  catch { throw new Error(`Gemini returned invalid JSON (HTTP ${response.status}).`); }
+  if (!response.ok) throw new Error(data?.error?.message || `Gemini API HTTP ${response.status}`);
 
-  if (!response.ok) {
-    console.error('[tarot-omen] Gemini conversation API error:', responseData);
-    throw new Error(responseData?.error?.message || `Gemini API HTTP ${response.status}`);
-  }
-
-  const generatedText = responseData?.candidates?.[0]?.content?.parts
+  const generated = data?.candidates?.[0]?.content?.parts
     ?.filter((part) => typeof part.text === 'string')
     .map((part) => part.text)
     .join('')
     .trim();
-
-  if (!generatedText) {
-    throw new Error('Gemini returned an empty conversation response.');
-  }
+  if (!generated) throw new Error('Gemini returned an empty conversation response.');
 
   let result;
-  try {
-    result = JSON.parse(generatedText);
-  } catch {
-    console.error('[tarot-omen] Gemini returned non-JSON conversation:', generatedText);
-    throw new Error('Gemini returned an invalid conversation format.');
-  }
+  try { result = JSON.parse(generated); }
+  catch { throw new Error('Gemini returned an invalid conversation format.'); }
 
-  const reply =
-    typeof result?.reply === 'string' ? capText(result.reply.trim(), 1800) : '';
-
-  if (!reply) {
-    throw new Error('Gemini returned an empty conversation reply.');
-  }
+  const reply = capText(typeof result?.reply === 'string' ? result.reply.trim() : '', 1800);
+  if (!reply) throw new Error('Gemini returned an empty conversation reply.');
 
   return {
     reply,
-    offerNewReading: result?.offer_new_reading === true
+    offerReading: result?.offer_reading === true
   };
 }
 
@@ -430,7 +335,7 @@ app.post('/api/interpret', async (req, res) => {
         ? body.question.trim()
         : String(body.question || '').trim();
 
-    const result = await generateInterpretation(question, body.cards);
+    const result = await generateInterpretation(question, body.cards, '');
     res.json(result);
   } catch (err) {
     console.error('[tarot-omen] /api/interpret failed:', err);
@@ -704,6 +609,13 @@ async function buildReadingImage(cards) {
     .toBuffer();
 }
 
+// ===== CONVERSATION SESSIONS =====
+// MVP storage: in-memory. A Render restart clears these sessions; persistent
+// conversation/payment storage can be added later without changing the reading logic.
+const sessions = new Map();
+const FREE_CONVERSATION_LIMIT = 3;
+const FREE_VOICE_REPLIES = 3;
+
 // ===== TELEGRAM =====
 
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
@@ -918,136 +830,144 @@ async function telegramSendVoice(chatId, audioBuffer) {
 
 async function handleTelegramUpdate(update) {
   const message = update?.message;
+  if (!message) return;
 
-  if (!message || !message.text) return;
+  // Voice/audio input is intentionally NOT supported. We do not call ElevenLabs STT,
+  // so user voice messages never consume ElevenLabs credits.
+  if (!message.text) return;
 
   const chatId = message.chat.id;
   const text = String(message.text || '').trim();
-  const session = getOmenSession(chatId);
+  const userName = String(message.from?.first_name || '').trim();
+
+  if (!text) return;
 
   if (text === '/start') {
-    omenSessions.set(chatId, createOmenSession());
-
+    sessions.delete(chatId);
     await telegramSendMessage(chatId, 'Задавай свой вопрос');
     return;
   }
 
   if (rateLimited(`tg:${chatId}`)) {
+    await telegramSendMessage(chatId, 'Слишком много запросов подряд. Попробуй через пару минут.');
+    return;
+  }
+
+  const session = sessions.get(chatId);
+
+  // ===== FREE CONVERSATION AFTER A COMPLETED READING =====
+  if (session?.reading && session.freeConversationUsed < FREE_CONVERSATION_LIMIT) {
+    try {
+      const result = await generateConversationResponse({
+        userName,
+        originalQuestion: session.reading.question,
+        cards: session.reading.cards,
+        interpretation: session.reading.interpretation,
+        history: session.history,
+        latestMessage: text
+      });
+
+      session.freeConversationUsed += 1;
+      session.history.push({ role: 'user', text });
+      session.history.push({ role: 'omen', text: result.reply });
+
+      // Voice is available for the first three free follow-up replies only.
+      if (session.voiceRepliesUsed < FREE_VOICE_REPLIES) {
+        try {
+          const voiceBuffer = await elevenLabsTextToSpeech(result.reply);
+          if (voiceBuffer) {
+            await telegramSendVoice(chatId, voiceBuffer);
+            session.voiceRepliesUsed += 1;
+          }
+        } catch (voiceErr) {
+          console.error('[tarot-omen] Conversation voice failed; continuing with text:', voiceErr);
+        }
+      }
+
+      await telegramSendMessage(chatId, result.reply);
+
+      if (result.offerReading) {
+        session.readingOfferShown = true;
+      }
+
+      // The third free message is the end of the free conversation window.
+      if (session.freeConversationUsed >= FREE_CONVERSATION_LIMIT && !result.offerReading) {
+        await telegramSendMessage(
+          chatId,
+          'Мне кажется, здесь уже появился отдельный вопрос. Если захочешь, можем посмотреть на него глубже.'
+        );
+      }
+
+      return;
+    } catch (err) {
+      console.error('[tarot-omen] Telegram conversation error:', err);
+      await telegramSendMessage(chatId, 'Не смог сейчас продолжить мысль. Попробуй ещё раз.');
+      return;
+    }
+  }
+
+  // After the free conversation window we do not generate more free AI replies.
+  // Paid continuation/payment flow will be connected separately.
+  if (session?.reading && session.freeConversationUsed >= FREE_CONVERSATION_LIMIT) {
     await telegramSendMessage(
       chatId,
-      'Слишком много запросов подряд. Попробуй через пару минут.'
+      'Если хочешь продолжить эту историю, можно посмотреть её глубже отдельным раскладом.'
     );
     return;
   }
 
   try {
-    // ===== FIRST FREE READING =====
-    if (!session.hasFreeReading) {
-      // Cards are chosen once. The exact same cards are sent to Gemini and shown to the user.
-      const cards = drawThreeCards();
+    // ===== NEW FREE THREE-CARD READING =====
+    const cards = drawThreeCards();
 
-      const mixingMessageIds = await telegramSendMessage(
-        chatId,
-        'Мешаю карты...',
-        true
-      );
+    const mixingMessageIds = await telegramSendMessage(chatId, 'Мешаю карты...', true);
+    const shuffleMessageId = await telegramSendShuffleGif(chatId);
 
-      const shuffleMessageId = await telegramSendShuffleGif(chatId);
+    const interpretationPromise = generateInterpretation(text, cards, userName);
+    const spreadImagePromise = buildReadingImage(cards);
+    const spreadImage = await spreadImagePromise;
 
-      const interpretationPromise = generateInterpretation(text, cards);
-      const spreadImagePromise = buildReadingImage(cards);
+    await telegramSendSpreadImage(chatId, spreadImage);
 
-      const spreadImage = await spreadImagePromise;
+    for (const messageId of mixingMessageIds || []) {
+      await telegramDeleteMessage(chatId, messageId);
+    }
+    await telegramDeleteMessage(chatId, shuffleMessageId);
 
-      await telegramSendSpreadImage(chatId, spreadImage);
+    await telegramSendMessage(chatId, CARDS_CAPTION);
+    await sleep(2000);
 
-      for (const messageId of mixingMessageIds || []) {
-        await telegramDeleteMessage(chatId, messageId);
-      }
-      await telegramDeleteMessage(chatId, shuffleMessageId);
+    const result = await interpretationPromise;
 
-      await telegramSendMessage(chatId, CARDS_CAPTION);
-      await sleep(2000);
-
-      const result = await interpretationPromise;
-
-      // The first free reading includes one voice message.
-      try {
-        const voiceBuffer = await elevenLabsTextToSpeech(result.voiceInterpretation);
-        if (voiceBuffer) {
-          await telegramSendVoice(chatId, voiceBuffer);
-        }
-      } catch (voiceErr) {
-        console.error('[tarot-omen] Voice generation failed; continuing with text:', voiceErr);
-      }
-
-      await telegramSendMessage(chatId, result.interpretation);
-
-      session.hasFreeReading = true;
-      session.initialQuestion = text;
-      session.initialCards = cards;
-      session.initialInterpretation = result.interpretation;
-      session.dialogueMessagesUsed = 0;
-      session.conversation = [];
-      session.pendingPaidReading = false;
-
-      return;
+    // First reading always gets voice + text.
+    try {
+      const voiceBuffer = await elevenLabsTextToSpeech(result.voiceInterpretation);
+      if (voiceBuffer) await telegramSendVoice(chatId, voiceBuffer);
+    } catch (voiceErr) {
+      console.error('[tarot-omen] Initial voice generation failed; continuing with text:', voiceErr);
     }
 
-    // ===== FREE CONVERSATION AFTER THE FIRST READING =====
-    // Free dialogue is text-only. Voice is intentionally not generated here.
-    if (session.pendingPaidReading) {
-      await telegramSendMessage(
-        chatId,
-        'Если хочешь продолжить, следующий расклад будет доступен в платном продолжении. Сейчас мы ещё не подключили оплату.'
-      );
-      return;
-    }
+    await telegramSendMessage(chatId, result.interpretation);
 
-    if (session.dialogueMessagesUsed >= OMEN_FREE_DIALOGUE_MESSAGES) {
-      session.pendingPaidReading = true;
-      await telegramSendMessage(
-        chatId,
-        'Я уже хорошо понимаю твою ситуацию. Если хочешь пойти дальше, можем посмотреть новый вопрос отдельным раскладом. Это будет платное продолжение.'
-      );
-      return;
-    }
-
-    session.dialogueMessagesUsed += 1;
-
-    const conversationResult = await generateConversationReply(session, text);
-
-    session.conversation.push({ role: 'user', text });
-    session.conversation.push({ role: 'omen', text: conversationResult.reply });
-
-    await telegramSendMessage(chatId, conversationResult.reply);
-
-    if (conversationResult.offerNewReading) {
-      session.pendingPaidReading = true;
-      await telegramSendMessage(
-        chatId,
-        '🔮 Хочешь посмотреть это отдельным раскладом? Это будет платное продолжение.'
-      );
-    } else if (session.dialogueMessagesUsed >= OMEN_FREE_DIALOGUE_MESSAGES) {
-      session.pendingPaidReading = true;
-      await telegramSendMessage(
-        chatId,
-        'Если хочешь продолжить разбирать ситуацию, следующий шаг — отдельный расклад. Это будет платное продолжение.'
-      );
-    }
+    sessions.set(chatId, {
+      userName,
+      reading: {
+        question: text,
+        cards,
+        interpretation: result.interpretation
+      },
+      history: [],
+      freeConversationUsed: 0,
+      voiceRepliesUsed: 0,
+      readingOfferShown: false
+    });
   } catch (err) {
-    console.error('[tarot-omen] Telegram reading/conversation error:', err);
+    console.error('[tarot-omen] Telegram reading error:', err);
 
     try {
-      await telegramSendMessage(
-        chatId,
-        'Не удалось получить ответ. Попробуй ещё раз.'
-      );
+      await telegramSendMessage(chatId, 'Не удалось получить расклад. Попробуй ещё раз.');
     } catch (sendErr) {
-      console.error(
-        '[tarot-omen] Telegram: failed to send error message:',
-        sendErr
-      );
+      console.error('[tarot-omen] Telegram: failed to send error message:', sendErr);
     }
   }
 }
