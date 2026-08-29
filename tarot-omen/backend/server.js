@@ -10,14 +10,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = process.env.PORT || 8787;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const OMEN_VOICE_ID = process.env.OMEN_VOICE_ID;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_WEBHOOK_URL =
   process.env.TELEGRAM_WEBHOOK_URL || 'https://tarot-omen1.onrender.com/telegram-webhook';
-
-// ElevenLabs voice for the Oracle. These are read from Render Environment Variables.
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-const OMEN_VOICE_ID = process.env.OMEN_VOICE_ID;
 
 if (!GEMINI_API_KEY) {
   console.warn('[tarot-omen] WARNING: GEMINI_API_KEY is not set.');
@@ -26,10 +24,10 @@ if (!TELEGRAM_BOT_TOKEN) {
   console.warn('[tarot-omen] WARNING: TELEGRAM_BOT_TOKEN is not set. Telegram bot will not run.');
 }
 if (!ELEVENLABS_API_KEY) {
-  console.warn('[tarot-omen] WARNING: ELEVENLABS_API_KEY is not set. Voice will be skipped.');
+  console.warn('[tarot-omen] WARNING: ELEVENLABS_API_KEY is not set. Voice messages will be skipped.');
 }
 if (!OMEN_VOICE_ID) {
-  console.warn('[tarot-omen] WARNING: OMEN_VOICE_ID is not set. Voice will be skipped.');
+  console.warn('[tarot-omen] WARNING: OMEN_VOICE_ID is not set. Voice messages will be skipped.');
 }
 
 const app = express();
@@ -64,21 +62,40 @@ You receive: a user's question, and three already-drawn Tarot cards (each with i
 position, name, and orientation — upright or reversed). The cards were chosen by a
 random generator before you were called. You never choose or invent cards.
 
-Write one unified, personal interpretation of the spread AS IT RELATES TO THE
-QUESTION — not a generic listing of card meanings. Specifically:
+Produce TWO versions of the SAME interpretation:
+
+1) "interpretation": the full text reading.
+- Write one unified, personal interpretation of the spread AS IT RELATES TO THE
+  QUESTION — not a generic listing of card meanings.
 - Read each card in light of its position (The Situation / What Influences It /
   Where It May Lead) and its orientation.
 - Weave the three cards into one coherent narrative, noting how they interact.
 - Be specific to the question's actual topic and phrasing.
-- Keep language reflective and open, e.g. "The cards suggest...", "This spread
-  points to...", "Seen through this reading...". Never claim certainty about the
-  future.
+- Keep language reflective and open. Never claim certainty about the future.
 - If the question concerns health: never diagnose. Offer only reflective
   interpretation and gently recommend a qualified professional when appropriate.
 - If the question concerns money or finance: never promise a financial outcome.
 - Reply in the same language the user's question is written in.
 - Length: about 4 short paragraphs. No headers, no bullet lists, no card-by-card
-  labels — a flowing reading.`;
+  labels — a flowing reading.
+
+2) "voice_interpretation": a SHORT spoken version of the same reading for Omen's
+  voice message.
+- It must communicate the most important insight from the full interpretation,
+  not introduce a different meaning.
+- 2 to 4 natural spoken sentences, roughly 180-450 characters when possible.
+- Sound like Omen is personally speaking to one person, not reading an article.
+- Calm, intimate, confident and slightly mysterious, but natural.
+- Use natural pauses and conversational phrasing.
+- Do not say "I will explain", "in the full interpretation", "the cards below",
+  or anything that refers to the text itself.
+- Do not list all three cards mechanically. Choose the most important thread
+  or insight from their interaction.
+- Do not give direct instructions or tell the user what they must do.
+- Reply in the same language as the user's question.
+
+Return ONLY valid JSON with exactly these two string fields:
+{"interpretation":"...","voice_interpretation":"..."}`;
 
 async function generateInterpretation(question, cards) {
   if (!GEMINI_API_KEY) {
@@ -117,7 +134,10 @@ async function generateInterpretation(question, cards) {
   const payload = {
     systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
     contents: [{ role: 'user', parts: [{ text: userMessage }] }],
-    generationConfig: { maxOutputTokens: 3000 }
+    generationConfig: {
+      maxOutputTokens: 3000,
+      responseMimeType: 'application/json'
+    }
   };
 
   let response;
@@ -128,7 +148,7 @@ async function generateInterpretation(question, cards) {
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       response = await fetch(
-        'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent',
+        'https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent',
         {
           method: 'POST',
           headers: {
@@ -173,20 +193,47 @@ async function generateInterpretation(question, cards) {
     throw new Error(responseData?.error?.message || `Gemini API HTTP ${response.status}`);
   }
 
-  const interpretation = responseData?.candidates?.[0]?.content?.parts
+  const generatedText = responseData?.candidates?.[0]?.content?.parts
     ?.filter((part) => typeof part.text === 'string')
     .map((part) => part.text)
-    .join('\n')
+    .join('')
     .trim();
 
-  if (!interpretation) {
+  if (!generatedText) {
     const reason = responseData?.candidates?.[0]?.finishReason;
     throw new Error(
-      reason ? `Gemini returned no text (finishReason: ${reason}).` : 'Gemini returned an empty interpretation.'
+      reason
+        ? `Gemini returned no text (finishReason: ${reason}).`
+        : 'Gemini returned an empty interpretation.'
     );
   }
 
-  return capText(interpretation, MAX_INTERPRETATION_CHARS);
+  let result;
+  try {
+    result = JSON.parse(generatedText);
+  } catch {
+    console.error('[tarot-omen] Gemini returned non-JSON interpretation:', generatedText);
+    throw new Error('Gemini returned an invalid interpretation format.');
+  }
+
+  const interpretation = capText(
+    typeof result?.interpretation === 'string' ? result.interpretation.trim() : '',
+    MAX_INTERPRETATION_CHARS
+  );
+  const voiceInterpretation =
+    typeof result?.voice_interpretation === 'string'
+      ? result.voice_interpretation.trim()
+      : '';
+
+  if (!interpretation) {
+    throw new Error('Gemini returned an empty interpretation.');
+  }
+
+  if (!voiceInterpretation) {
+    throw new Error('Gemini returned an empty voice interpretation.');
+  }
+
+  return { interpretation, voiceInterpretation };
 }
 
 app.post('/api/interpret', async (req, res) => {
@@ -205,8 +252,8 @@ app.post('/api/interpret', async (req, res) => {
         ? body.question.trim()
         : String(body.question || '').trim();
 
-    const interpretation = await generateInterpretation(question, body.cards);
-    res.json({ interpretation });
+    const result = await generateInterpretation(question, body.cards);
+    res.json(result);
   } catch (err) {
     console.error('[tarot-omen] /api/interpret failed:', err);
 
@@ -623,94 +670,6 @@ async function telegramDeleteMessage(chatId, messageId) {
   }
 }
 
-function makeVoiceText(answer) {
-  // Keep the voice short and natural: use the first 2 complete sentences
-  // of the already generated interpretation, so the spoken message never
-  // invents a second reading and never disagrees with the text shown above.
-  const clean = String(answer || '').replace(/\s+/g, ' ').trim();
-  if (!clean) return '';
-
-  const matches = clean.match(/.*?[.!?](?:\s|$)/g) || [];
-  let voiceText = matches.slice(0, 2).join(' ').trim();
-
-  if (!voiceText) voiceText = clean;
-  if (voiceText.length > 500) {
-    voiceText = voiceText.slice(0, 500);
-    const lastStop = Math.max(
-      voiceText.lastIndexOf('.'),
-      voiceText.lastIndexOf('!'),
-      voiceText.lastIndexOf('?')
-    );
-    if (lastStop > 180) voiceText = voiceText.slice(0, lastStop + 1);
-  }
-
-  return voiceText;
-}
-
-async function generateOmenVoice(text) {
-  if (!ELEVENLABS_API_KEY || !OMEN_VOICE_ID) {
-    console.warn('[tarot-omen] ElevenLabs is not configured; skipping voice.');
-    return null;
-  }
-
-  if (!text || !text.trim()) return null;
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
-
-  try {
-    const response = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(OMEN_VOICE_ID)}?output_format=mp3_44100_128`,
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'xi-api-key': ELEVENLABS_API_KEY,
-          'Accept': 'audio/mpeg'
-        },
-        body: JSON.stringify({
-          text: text.trim(),
-          model_id: 'eleven_v3'
-        }),
-        signal: controller.signal
-      }
-    );
-
-    if (!response.ok) {
-      const errorBody = await response.text();
-      throw new Error(`ElevenLabs HTTP ${response.status}: ${errorBody}`);
-    }
-
-    return Buffer.from(await response.arrayBuffer());
-  } catch (err) {
-    if (err?.name === 'AbortError') {
-      throw new Error('ElevenLabs request timed out after 30 seconds.');
-    }
-    throw err;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function telegramSendVoice(chatId, audioBuffer) {
-  const form = new FormData();
-  form.append('chat_id', String(chatId));
-  form.append(
-    'voice',
-    new Blob([audioBuffer], { type: 'audio/mpeg' }),
-    'omen.mp3'
-  );
-
-  const response = await fetch(`${TELEGRAM_API}/sendVoice`, {
-    method: 'POST',
-    body: form
-  });
-
-  if (!response.ok) {
-    throw new Error(`Telegram sendVoice failed: ${await response.text()}`);
-  }
-}
-
 async function telegramSendSpreadImage(chatId, imageBuffer) {
   const form = new FormData();
   form.append('chat_id', String(chatId));
@@ -727,6 +686,55 @@ async function telegramSendSpreadImage(chatId, imageBuffer) {
 
   if (!response.ok) {
     throw new Error(`Telegram sendPhoto (spread) failed: ${await response.text()}`);
+  }
+}
+
+async function elevenLabsTextToSpeech(text) {
+  if (!ELEVENLABS_API_KEY || !OMEN_VOICE_ID) {
+    return null;
+  }
+
+  const response = await fetch(
+    `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(OMEN_VOICE_ID)}?output_format=mp3_44100_128`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'xi-api-key': ELEVENLABS_API_KEY
+      },
+      body: JSON.stringify({
+        text,
+        model_id: 'eleven_v3'
+      })
+    }
+  );
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`ElevenLabs TTS failed: ${body}`);
+  }
+
+  return Buffer.from(await response.arrayBuffer());
+}
+
+async function telegramSendVoice(chatId, audioBuffer) {
+  if (!audioBuffer) return;
+
+  const form = new FormData();
+  form.append('chat_id', String(chatId));
+  form.append(
+    'voice',
+    new Blob([audioBuffer], { type: 'audio/mpeg' }),
+    'omen.mp3'
+  );
+
+  const response = await fetch(`${TELEGRAM_API}/sendVoice`, {
+    method: 'POST',
+    body: form
+  });
+
+  if (!response.ok) {
+    throw new Error(`Telegram sendVoice failed: ${await response.text()}`);
   }
 }
 
@@ -794,24 +802,21 @@ async function handleTelegramUpdate(update) {
     // Deliberate 2-second pause after the cards and explanatory text appear.
     await sleep(2000);
 
-    // If Gemini is still working, this waits only as long as necessary.
-    const answer = await interpretationPromise;
+    // Gemini returns the full reading and a short spoken version of the same reading.
+    const result = await interpretationPromise;
 
-    await telegramSendMessage(chatId, answer);
-
-    // Voice is made from the same interpretation that the user just received.
-    // If ElevenLabs fails, the text reading remains fully functional.
-    const voiceText = makeVoiceText(answer);
-    if (voiceText) {
-      try {
-        const voiceBuffer = await generateOmenVoice(voiceText);
-        if (voiceBuffer) {
-          await telegramSendVoice(chatId, voiceBuffer);
-        }
-      } catch (voiceErr) {
-        console.error('[tarot-omen] ElevenLabs voice error:', voiceErr);
+    // Voice is an enhancement for the MVP: if ElevenLabs is unavailable,
+    // the normal text reading still works.
+    try {
+      const voiceBuffer = await elevenLabsTextToSpeech(result.voiceInterpretation);
+      if (voiceBuffer) {
+        await telegramSendVoice(chatId, voiceBuffer);
       }
+    } catch (voiceErr) {
+      console.error('[tarot-omen] Voice generation failed; continuing with text:', voiceErr);
     }
+
+    await telegramSendMessage(chatId, result.interpretation);
   } catch (err) {
     console.error('[tarot-omen] Telegram reading error:', err);
 
