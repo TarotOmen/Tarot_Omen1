@@ -244,7 +244,18 @@ async function generateInterpretation(question, cards, userName = '') {
     throw new Error('Gemini returned an empty voice interpretation.');
   }
 
-  return { interpretation, voiceInterpretation };
+  const conversationQuestion = capText(
+    typeof result?.conversation_question === 'string'
+      ? result.conversation_question.trim()
+      : '',
+    600
+  );
+
+  if (!conversationQuestion) {
+    throw new Error('Gemini returned an empty conversation question.');
+  }
+
+  return { interpretation, voiceInterpretation, conversationQuestion };
 }
 
 
@@ -1028,6 +1039,12 @@ async function handleTelegramUpdate(update) {
 
     await telegramSendMessage(chatId, result.interpretation);
 
+    // Every completed reading ends with one separate, context-aware question.
+    // It is generated together with the interpretation, so it does not create
+    // an extra Gemini request. This question is conversation-only: it never
+    // mentions payment or tries to sell a new spread.
+    await telegramSendMessage(chatId, result.conversationQuestion);
+
     sessions.set(chatId, {
       userName,
       reading: {
@@ -1035,7 +1052,9 @@ async function handleTelegramUpdate(update) {
         cards,
         interpretation: result.interpretation
       },
-      history: [],
+      history: [
+        { role: 'omen', text: result.conversationQuestion }
+      ],
       freeConversationUsed: 0,
       paidContinuation: PAID_CONTINUATION_DEFAULT,
       readingOfferShown: false
