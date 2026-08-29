@@ -622,6 +622,8 @@ const FREE_COOLDOWN_MS = 3 * 24 * 60 * 60 * 1000;
 const PAID_CONTINUATION_DEFAULT = false;
 const processedPaymentCharges = new Set();
 const processedLavaPayments = new Set();
+let resolvedLavaReadingOfferId = '';
+let resolvedLavaCelticOfferId = '';
 
 if (!Number.isInteger(PAID_READING_STARS) || PAID_READING_STARS < 1) {
   throw new Error('PAID_READING_STARS must be a positive integer.');
@@ -1089,15 +1091,87 @@ function findFirstDeepValue(value, keys, depth = 0) {
   return undefined;
 }
 
+
+async function resolveLavaOfferId(kind) {
+  const cached = kind === 'celtic' ? resolvedLavaCelticOfferId : resolvedLavaReadingOfferId;
+  if (cached) return cached;
+  if (!LAVA_API_KEY) throw new Error('LAVA_API_KEY is not configured.');
+
+  const response = await fetch(
+    `${LAVA_API_URL}/api/v2/products?feedVisibility=ALL`,
+    {
+      headers: {
+        Accept: 'application/json',
+        'X-Api-Key': LAVA_API_KEY
+      }
+    }
+  );
+
+  const raw = await response.text();
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error(`LAVA products lookup returned invalid JSON (HTTP ${response.status}).`);
+  }
+
+  if (!response.ok) {
+    console.error('[tarot-omen] LAVA products lookup failed:', {
+      status: response.status,
+      data
+    });
+    throw new Error(data?.message || data?.error?.message || `LAVA products HTTP ${response.status}`);
+  }
+
+  const target = kind === 'celtic' ? 'кельтский крест' : 'таро-расклад';
+  const products = [];
+
+  const walk = (value, depth = 0) => {
+    if (depth > 6 || value == null || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item, depth + 1);
+      return;
+    }
+
+    const name = String(
+      value.name ?? value.title ?? value.productName ?? value.contentName ?? ''
+    ).trim().toLowerCase();
+
+    const id = String(
+      value.offerId ?? value.orderId ?? value.id ?? value.productId ?? ''
+    ).trim();
+
+    if (name && id) products.push({ name, id });
+    for (const child of Object.values(value)) walk(child, depth + 1);
+  };
+
+  walk(data);
+
+  const exact = products.find((item) => item.name === target);
+  const partial = products.find((item) => item.name.includes(target));
+  const resolved = exact?.id || partial?.id;
+
+  if (!resolved) {
+    console.error('[tarot-omen] LAVA target product not found:', {
+      target,
+      products: products.slice(0, 50)
+    });
+    throw new Error(`LAVA product "${target}" was not found.`);
+  }
+
+  if (kind === 'celtic') resolvedLavaCelticOfferId = resolved;
+  else resolvedLavaReadingOfferId = resolved;
+
+  console.log(`[tarot-omen] LAVA ${kind} offerId resolved from product feed.`);
+  return resolved;
+}
+
 async function lavaCreateInvoice(chatId, session, kind, currency) {
   if (!LAVA_API_KEY) {
     throw new Error('LAVA_API_KEY is not configured.');
   }
 
-  const offerId = kind === 'celtic' ? LAVA_CELTIC_OFFER_ID : LAVA_READING_OFFER_ID;
-  if (!offerId) {
-    throw new Error(`LAVA_${kind === 'celtic' ? 'CELTIC' : 'READING'}_OFFER_ID is not configured.`);
-  }
+  let offerId = kind === 'celtic' ? LAVA_CELTIC_OFFER_ID : LAVA_READING_OFFER_ID;
 
   const normalizedCurrency = currency === 'USD' ? 'USD' : 'RUB';
   const amount = kind === 'celtic'
@@ -1112,34 +1186,71 @@ async function lavaCreateInvoice(chatId, session, kind, currency) {
     amount
   };
 
-  const response = await fetch(`${LAVA_API_URL}/api/v3/invoice`, {
-    method: 'POST',
-    headers: {
-      Accept: 'application/json',
-      'Content-Type': 'application/json',
-      'X-Api-Key': LAVA_API_KEY
-    },
-    body: JSON.stringify(payload)
-  });
-
-  const raw = await response.text();
-  let data;
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    console.error('[tarot-omen] LAVA returned non-JSON response:', {
-      status: response.status,
-      bodyPreview: raw.slice(0, 500)
+  const createInvoice = async (currentOfferId) => {
+    const response = await fetch(`${LAVA_API_URL}/api/v3/invoice`, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+        'X-Api-Key': LAVA_API_KEY
+      },
+      body: JSON.stringify({
+        ...payload,
+        offerId: currentOfferId
+      })
     });
-    throw new Error(`LAVA returned invalid JSON (HTTP ${response.status}).`);
+
+    const raw = await response.text();
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      console.error('[tarot-omen] LAVA returned non-JSON response:', {
+        status: response.status,
+        bodyPreview: raw.slice(0, 500)
+      });
+      throw new Error(`LAVA returned invalid JSON (HTTP ${response.status}).`);
+    }
+
+    return { response, data };
+  };
+
+  if (!offerId) {
+    offerId = await resolveLavaOfferId(kind);
   }
+
+  let result = await createInvoice(offerId);
+
+  // If the dashboard UUID isn't the Public API offerId, resolve the actual
+  // hidden API product and retry once.
+  if (
+    result.response.status === 404 &&
+    /Product with offer id/i.test(
+      String(result.data?.error || result.data?.message || result.data?.details?.error || '')
+    )
+  ) {
+    const resolved = await resolveLavaOfferId(kind);
+    if (resolved !== offerId) {
+      offerId = resolved;
+      result = await createInvoice(offerId);
+    }
+  }
+
+  const response = result.response;
+  const data = result.data;
 
   if (!response.ok) {
     console.error('[tarot-omen] LAVA invoice error:', {
       status: response.status,
-      data
+      data,
+      offerId
     });
-    throw new Error(data?.message || data?.error?.message || data?.error || `LAVA API HTTP ${response.status}`);
+    throw new Error(
+      data?.message ||
+      data?.error?.message ||
+      data?.error ||
+      `LAVA API HTTP ${response.status}`
+    );
   }
 
   const paymentUrl = findFirstDeepValue(data, [
@@ -1650,14 +1761,11 @@ async function handleTelegramUpdate(update) {
       session.freeConversationUsed >= FREE_CONVERSATION_LIMIT &&
       Number(session.paidReadingsRemaining || 0) === 0 &&
       !session.pendingGiftReading) {
-    if (!session.readingOfferShown) {
-      const offerQuestion = session.pendingReadingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом';
-      await telegramSendMessage(
-        chatId,
-        'Чтобы продолжить эту историю сейчас, можно открыть следующий расклад. После оплаты ты получишь два расклада: один сейчас и ещё один — в подарок. Если не хочешь оплачивать сейчас, ничего страшного — через 72 часа у тебя снова появится бесплатный расклад, и мы продолжим эту же историю с сохранённым контекстом.'
-      );
-      await offerPaidContinuation(chatId, session, offerQuestion);
-    }
+    // This gate must remain active even after /start or a deleted Telegram chat:
+    // the server-side session is intentionally preserved during the test run.
+    // Every blocked user message gets one clear choice: pay now or wait 72h.
+    const offerQuestion = session.pendingReadingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом';
+    await offerPaidContinuation(chatId, session, offerQuestion);
     return;
   }
 
@@ -1694,12 +1802,12 @@ async function handleTelegramUpdate(update) {
         if (Number(session.paidReadingsRemaining || 0) > 0) {
           await offerGiftReading(chatId, session);
         } else {
-          await telegramSendMessage(
-            chatId,
-            'Эта часть истории подошла к завершению. Можно открыть новое платное продолжение — в нём снова будет два расклада, второй в подарок. Если не спешишь, через 72 часа появится бесплатный расклад, и мы продолжим эту же историю.'
-          );
           session.readingOfferShown = false;
-          await offerPaidContinuation(chatId, session, session.pendingReadingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом');
+          await offerPaidContinuation(
+            chatId,
+            session,
+            session.pendingReadingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом'
+          );
         }
       }
       return;
@@ -1741,10 +1849,6 @@ async function handleTelegramUpdate(update) {
       if (session.freeConversationUsed >= FREE_CONVERSATION_LIMIT) {
         session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
         const offerQuestion = session.pendingReadingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом';
-        await telegramSendMessage(
-          chatId,
-          'Если хочешь продолжить эту историю сейчас, можно открыть следующий расклад. После оплаты ты получишь два расклада: один сейчас и ещё один — в подарок. Если не хочешь оплачивать сейчас, можно подождать 72 часа — после этого снова будет доступен бесплатный расклад, и мы продолжим эту же историю.'
-        );
         await offerPaidContinuation(chatId, session, offerQuestion);
       } else {
         await telegramSendMessage(chatId, result.nextMessage);
