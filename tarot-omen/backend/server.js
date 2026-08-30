@@ -958,6 +958,34 @@ async function telegramSendInlineKeyboardWithRetry(chatId, text, buttons, attemp
   throw lastError || new Error('Telegram keyboard delivery failed.');
 }
 
+async function telegramEditInlineKeyboard(chatId, messageId, buttons) {
+  const response = await fetch(`${TELEGRAM_API}/editMessageReplyMarkup`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+      reply_markup: { inline_keyboard: buttons }
+    })
+  });
+  if (!response.ok) {
+    throw new Error(`Telegram editMessageReplyMarkup failed: ${await response.text()}`);
+  }
+}
+
+async function telegramEditInlineKeyboardWithRetry(chatId, messageId, buttons, attempts = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await telegramEditInlineKeyboard(chatId, messageId, buttons);
+    } catch (err) {
+      lastError = err;
+      if (attempt < attempts) await sleep(attempt * 700);
+    }
+  }
+  throw lastError || new Error('Telegram keyboard edit failed.');
+}
+
 async function telegramSendOracle(chatId) {
   const imageBuffer = await readFile(ORACLE_IMAGE_PATH);
 
@@ -1307,13 +1335,26 @@ async function offerPaidContinuation(chatId, session, readingQuestion = '') {
 
   await telegramSendInlineKeyboardWithRetry(
     chatId,
-    'Если хочешь продолжить эту историю сейчас, можно открыть следующий расклад. После оплаты ты получишь два расклада: один сейчас и ещё один — в подарок. Если не спешишь, можно подождать 72 часа — после этого снова будет доступен бесплатный расклад, и мы продолжим эту же историю.',
+    'Если хочешь продолжить эту историю сейчас, есть два варианта. Обычный расклад — 3 карты, чтобы посмотреть следующий слой ситуации. Или расширенный — Кельтский крест из 10 карт: он даст более глубокое погружение и позволит посмотреть ситуацию с многих сторон. Для обычного расклада после оплаты ты получишь два расклада: один сейчас и ещё один — в подарок. Кельтский крест — отдельный расширенный расклад.',
     [
-      [{ text: `⭐ Telegram Stars — ${PAID_READING_STARS}`, callback_data: 'pay:stars:reading' }],
-      [{ text: `💳 Карта — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB:CARD' }],
-      [{ text: `🏦 СБП — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB:SBP' }],
-      [{ text: `🌍 Зарубежная карта — $${LAVA_READING_USD}`, callback_data: 'pay:lava:reading:USD' }],
-      [{ text: '🧪 Кельтский крест — тест бесплатно', callback_data: 'test:celtic:payment' }]
+      [{ text: `⭐ Обычный — ${PAID_READING_STARS} Stars`, callback_data: 'pay:stars:reading' }],
+      [{ text: `💳 Обычный — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB:CARD' }],
+      [{ text: `🏦 Обычный СБП — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB:SBP' }],
+      [{ text: `🌍 Обычный — $${LAVA_READING_USD}`, callback_data: 'pay:lava:reading:USD' }],
+      [{ text: '🔮 Кельтский крест — 10 карт', callback_data: 'choose:celtic:payment' }]
+    ]
+  );
+}
+
+async function offerCelticPaymentMethods(chatId, messageId) {
+  await telegramEditInlineKeyboardWithRetry(
+    chatId,
+    messageId,
+    [
+      [{ text: `⭐ Telegram Stars — ${CELTIC_CROSS_STARS}`, callback_data: 'pay:stars:celtic' }],
+      [{ text: `💳 Карта — ${LAVA_CELTIC_RUB} ₽`, callback_data: 'pay:lava:celtic:RUB:CARD' }],
+      [{ text: `🏦 СБП — ${LAVA_CELTIC_RUB} ₽`, callback_data: 'pay:lava:celtic:RUB:SBP' }],
+      [{ text: `🌍 Зарубежная карта — $${LAVA_CELTIC_USD}`, callback_data: 'pay:lava:celtic:USD' }]
     ]
   );
 }
@@ -1668,46 +1709,6 @@ async function sendStartMessage(chatId) {
   }
 }
 
-async function runFreeTestCelticReading(chatId, session) {
-  if (!session?.reading) {
-    throw new Error('Сначала нужен основной расклад.');
-  }
-
-  const question =
-    session.pendingReadingQuestion ||
-    session.reading.question ||
-    'Посмотреть эту историю глубже';
-
-  const snapshot = {
-    reading: session.reading,
-    history: Array.isArray(session.history) ? [...session.history] : [],
-    freeConversationUsed: session.freeConversationUsed,
-    paidConversationUsed: session.paidConversationUsed,
-    paidReadingsRemaining: session.paidReadingsRemaining,
-    paidReadingActive: session.paidReadingActive,
-    paidPackageKind: session.paidPackageKind,
-    paidContinuation: session.paidContinuation,
-    pendingGiftReading: session.pendingGiftReading,
-    readingOfferShown: session.readingOfferShown,
-    pendingReadingQuestion: session.pendingReadingQuestion,
-    pendingPayment: session.pendingPayment,
-    pendingLavaPayment: session.pendingLavaPayment,
-    freeCooldownUsed: session.freeCooldownUsed,
-    freeCooldownAvailableAt: session.freeCooldownAvailableAt,
-    lastPaidReadingAt: session.lastPaidReadingAt
-  };
-
-  try {
-    await telegramSendMessage(
-      chatId,
-      '🧪 Кельтский крест — тест бесплатно. Сейчас Omen посмотрит всю эту же историю глубже, сохранив контекст твоего вопроса и предыдущего разговора.'
-    );
-    await runPaidCelticReading(chatId, session, question, { test: true });
-  } finally {
-    Object.assign(session, snapshot);
-  }
-}
-
 async function handleTelegramUpdate(update) {
   if (update?.pre_checkout_query) {
     try {
@@ -1728,11 +1729,11 @@ async function handleTelegramUpdate(update) {
     const chatId = callback.message?.chat?.id;
     const session = sessions.get(chatId);
     try {
-      if (callback.data === 'test:celtic:payment') {
-        await runFreeTestCelticReading(chatId, session);
-      } else if (callback.data === 'test:celtic') {
-        // Backward compatibility for an older test button; no longer exposed in /start.
-        await runFreeTestCelticReading(chatId, session);
+      if (callback.data === 'choose:celtic:payment') {
+        if (!session?.reading) {
+          throw new Error('Сначала нужен основной расклад.');
+        }
+        await offerCelticPaymentMethods(chatId, callback.message?.message_id);
       } else if (callback.data === 'pay:stars:reading') {
         await createPaymentInvoice(chatId, session, 'reading', 'STARS');
       } else if (callback.data === 'pay:stars:celtic') {
