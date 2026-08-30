@@ -682,15 +682,20 @@ async function buildCelticCrossImage(cards) {
 // ===== CONVERSATION SESSIONS =====
 // MVP storage: in-memory. A Render restart clears sessions.
 const sessions = new Map();
-const PAID_READING_STARS = Number(process.env.PAID_READING_STARS || 49);
-const CELTIC_CROSS_STARS = Number(process.env.CELTIC_CROSS_STARS || 89);
 
-const TRIBUTE_READING_RUB = 49;
-const TRIBUTE_CELTIC_RUB = 99;
+// Current product prices. Paid reading packages never expire by time; only usage reduces
+// their remaining entitlements.
+const PAID_READING_STARS = 90;
+const CELTIC_CROSS_STARS = 140;
+
+const TRIBUTE_READING_RUB = 100;
+const TRIBUTE_CELTIC_RUB = 150;
 
 const FREE_CONVERSATION_LIMIT = 3;
 const PAID_CONVERSATION_LIMIT = 3;
-const PAID_READINGS_PER_PACKAGE = 2;
+const ORDINARY_READINGS_PER_PACKAGE = 5; // 3 paid + 2 gifted, all are ordinary 3-card readings.
+const CELTIC_CROSSES_PER_PACKAGE = 1;
+const CELTIC_GIFT_ORDINARY_READINGS_PER_PACKAGE = 2;
 const FREE_COOLDOWN_MS = 3 * 24 * 60 * 60 * 1000;
 const PAID_CONTINUATION_DEFAULT = false;
 const processedPaymentCharges = new Set();
@@ -1238,9 +1243,18 @@ async function tributeGetProductById(productId) {
 async function tributeCreatePaymentLink(kind) {
   const product = await tributeGetProductForKind(kind);
   const paymentUrl = String(product?.webLink || product?.link || '').trim();
+  const expectedAmount = (kind === 'celtic' ? TRIBUTE_CELTIC_RUB : TRIBUTE_READING_RUB) * 100;
+  const actualAmount = Number(product?.amount);
+  const actualCurrency = String(product?.currency || '').toUpperCase();
 
   if (!paymentUrl) {
     throw new Error(`Tribute product ${product?.id || '?'} has no payment link.`);
+  }
+
+  if (actualCurrency !== 'RUB' || actualAmount !== expectedAmount) {
+    throw new Error(
+      `Tribute product ${product?.id || '?'} price mismatch: expected ${expectedAmount} RUB minor units, got ${actualAmount} ${actualCurrency}.`
+    );
   }
 
   return {
@@ -1311,14 +1325,17 @@ async function handleTributeWebhook(body) {
 
   const amount = Number(payload.amount);
   const currency = String(payload.currency || '').toUpperCase();
-  if (Number.isFinite(amount) && currency !== 'RUB') {
-    console.warn('[tarot-omen] Tribute purchase uses a non-RUB currency.', {
+  const expectedAmount = (kind === 'celtic' ? TRIBUTE_CELTIC_RUB : TRIBUTE_READING_RUB) * 100;
+  if (!Number.isFinite(amount) || amount !== expectedAmount || currency !== 'RUB') {
+    console.warn('[tarot-omen] Tribute purchase amount/currency mismatch.', {
       kind,
       productId,
+      expectedAmount,
       amount,
       currency,
       purchaseId
     });
+    return;
   }
 
   let session = sessions.get(telegramUserId);
@@ -1330,9 +1347,11 @@ async function handleTributeWebhook(body) {
       freeConversationUsed: FREE_CONVERSATION_LIMIT,
       paidConversationUsed: 0,
       paidReadingsRemaining: 0,
+      paidCelticRemaining: 0,
       paidReadingActive: false,
       paidPackageKind: 'reading',
       pendingGiftReading: false,
+      pendingPaidReadingKind: '',
       paidContinuation: false,
       readingOfferShown: false,
       pendingReadingQuestion: '',
@@ -1369,12 +1388,12 @@ async function handleTributeWebhook(body) {
   activatePaidPackage(session, kind);
 
   if (kind === 'celtic') {
-    await telegramSendMessage(telegramUserId, 'Оплата прошла. Запускаю Кельтский крест — 10 карт и подробный разбор.');
+    await telegramSendMessage(telegramUserId, 'Оплата прошла. У тебя 1 Кельтский крест и 2 обычных расклада в подарок. Запускаю Кельтский крест — 10 карт и подробный разбор.');
     await runPaidCelticReading(telegramUserId, session, question);
     return;
   }
 
-  await telegramSendMessage(telegramUserId, 'Оплата прошла. В пакет входят два расклада: один сейчас и ещё один — в подарок. Начинаем первый.');
+  await telegramSendMessage(telegramUserId, 'Оплата прошла. У тебя 5 обычных раскладов: 3 входят в пакет и ещё 2 — в подарок. Начинаем первый.');
   await runPaidThreeCardReading(telegramUserId, session, question);
 }
 
@@ -1396,7 +1415,7 @@ async function telegramSendPaymentUrl(chatId, text, url) {
 }
 
 function buildPaidContinuationText() {
-  return 'Если хочешь продолжить эту историю сейчас, есть два варианта. Обычный расклад — 3 карты, чтобы посмотреть следующий слой ситуации. Или расширенный — Кельтский крест из 10 карт: он даст более глубокое погружение и позволит посмотреть ситуацию с многих сторон. Для обычного расклада после оплаты ты получишь два расклада: один сейчас и ещё один — в подарок. Кельтский крест — отдельный расширенный расклад.';
+  return 'Если хочешь продолжить эту историю сейчас, можно купить новый пакет. Обычный расклад — 3 карты: после оплаты ты получишь 5 обычных раскладов, из них 2 — в подарок. Кельтский крест — 10 карт: после оплаты получишь 1 Кельтский крест и 2 обычных расклада в подарок. Неиспользованные расклады не сгорают.';
 }
 
 function buildPaidContinuationButtons() {
@@ -1439,14 +1458,43 @@ async function offerCelticPaymentMethods(chatId, messageId) {
   );
 }
 
-async function offerGiftReading(chatId, session) {
+async function offerAvailablePaidReadings(chatId, session) {
+  const buttons = [];
+
+  if (Number(session.paidReadingsRemaining || 0) > 0) {
+    buttons.push([{
+      text: `🃏 Использовать обычный расклад — осталось ${session.paidReadingsRemaining}`,
+      callback_data: 'use:paid:reading'
+    }]);
+  }
+
+  if (Number(session.paidCelticRemaining || 0) > 0) {
+    buttons.push([{
+      text: `🔮 Использовать Кельтский крест — осталось ${session.paidCelticRemaining}`,
+      callback_data: 'use:paid:celtic'
+    }]);
+  }
+
+  if (!buttons.length) {
+    session.pendingGiftReading = false;
+    session.pendingPaidReadingKind = '';
+    return;
+  }
+
   session.pendingGiftReading = true;
   session.readingOfferShown = false;
 
+  const ordinaryText = Number(session.paidReadingsRemaining || 0) > 0
+    ? `Обычных раскладов осталось: ${session.paidReadingsRemaining}.`
+    : '';
+  const celticText = Number(session.paidCelticRemaining || 0) > 0
+    ? `Кельтских крестов осталось: ${session.paidCelticRemaining}.`
+    : '';
+
   await telegramSendInlineKeyboard(
     chatId,
-    'В этом продолжении у тебя остался ещё один расклад в подарок. Можем использовать его сейчас или оставить на потом — он никуда не исчезнет.',
-    [[{ text: '🔮 Использовать подарок', callback_data: 'gift:reading' }]]
+    `У тебя остались оплаченные расклады. Они не сгорают и будут доступны, пока ты их не используешь.\n${ordinaryText}\n${celticText}`.trim(),
+    buttons
   );
 }
 
@@ -1581,16 +1629,37 @@ async function createPaymentInvoice(chatId, session, kind, currency = 'STARS', p
   );
 }
 
+function hasPaidEntitlements(session) {
+  return (
+    Number(session?.paidReadingsRemaining || 0) > 0 ||
+    Number(session?.paidCelticRemaining || 0) > 0
+  );
+}
+
 function activatePaidPackage(session, kind = 'reading') {
+  const safeKind = kind === 'celtic' ? 'celtic' : 'reading';
+
   session.paidContinuation = true;
-  session.paidPackageKind = kind;
-  session.paidReadingsRemaining = kind === 'celtic' ? 0 : PAID_READINGS_PER_PACKAGE;
+  session.paidPackageKind = safeKind;
   session.paidConversationUsed = 0;
   session.freeConversationUsed = FREE_CONVERSATION_LIMIT;
   session.freeCooldownUsed = false;
-  session.freeCooldownAvailableAt = 0;
   session.readingOfferShown = false;
   session.pendingGiftReading = false;
+  session.pendingPaidReadingKind = '';
+
+  if (safeKind === 'celtic') {
+    // One Celtic Cross plus two ordinary three-card readings as gifts.
+    session.paidCelticRemaining = Number(session.paidCelticRemaining || 0) + CELTIC_CROSSES_PER_PACKAGE;
+    session.paidReadingsRemaining =
+      Number(session.paidReadingsRemaining || 0) + CELTIC_GIFT_ORDINARY_READINGS_PER_PACKAGE;
+  } else {
+    // Five ordinary readings total: three included in the package + two gifts.
+    session.paidReadingsRemaining =
+      Number(session.paidReadingsRemaining || 0) + ORDINARY_READINGS_PER_PACKAGE;
+  }
+
+  session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
 }
 
 async function handleSuccessfulPayment(message) {
@@ -1712,10 +1781,12 @@ async function runPaidCelticReading(chatId, session, question, options = {}) {
     session.history = Array.isArray(session.history) ? session.history.slice(-24) : [];
     session.paidConversationUsed = 0;
     session.paidReadingActive = true;
-    session.paidReadingsRemaining = 0;
-    session.paidPackageKind = 'celtic';
+    session.paidCelticRemaining = Math.max(0, Number(session.paidCelticRemaining || 0) - 1);
+    session.paidPackageKind = hasPaidEntitlements(session) ? 'mixed' : 'celtic';
     session.readingOfferShown = false;
     session.pendingReadingQuestion = '';
+    session.pendingGiftReading = false;
+    session.pendingPaidReadingKind = '';
     session.lastPaidReadingAt = Date.now();
     session.freeConversationUsed = FREE_CONVERSATION_LIMIT;
     session.freeCooldownUsed = false;
@@ -1775,8 +1846,12 @@ async function runPaidThreeCardReading(chatId, session, question) {
     session.paidConversationUsed = 0;
     session.paidReadingsRemaining = Math.max(0, Number(session.paidReadingsRemaining || 0) - 1);
     session.paidReadingActive = true;
+    session.paidContinuation = true;
+    session.paidPackageKind = hasPaidEntitlements(session) ? 'mixed' : 'reading';
     session.readingOfferShown = false;
     session.pendingReadingQuestion = '';
+    session.pendingGiftReading = false;
+    session.pendingPaidReadingKind = '';
     session.lastPaidReadingAt = Date.now();
     session.freeCooldownUsed = false;
     session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
@@ -1840,12 +1915,21 @@ async function handleTelegramUpdate(update) {
         await createPaymentInvoice(chatId, session, 'reading', 'RUB');
       } else if (callback.data === 'pay:tribute:celtic') {
         await createPaymentInvoice(chatId, session, 'celtic', 'RUB');
-      } else if (callback.data === 'gift:reading') {
+      } else if (callback.data === 'use:paid:reading') {
         if (session?.pendingGiftReading && session?.paidReadingsRemaining > 0) {
           session.pendingGiftReading = false;
+          session.pendingPaidReadingKind = '';
           session.pendingReadingQuestion = '';
-          await telegramSendMessage(chatId, 'Тогда используем твой подарок. Посмотрим следующий слой этой истории.');
+          await telegramSendMessage(chatId, `Используем обычный расклад. Осталось после этого: ${Math.max(0, Number(session.paidReadingsRemaining || 0) - 1)}.`);
           await runPaidThreeCardReading(chatId, session, session.reading?.question || 'Посмотреть следующий слой этой истории');
+        }
+      } else if (callback.data === 'use:paid:celtic') {
+        if (session?.pendingGiftReading && session?.paidCelticRemaining > 0) {
+          session.pendingGiftReading = false;
+          session.pendingPaidReadingKind = '';
+          session.pendingReadingQuestion = '';
+          await telegramSendMessage(chatId, 'Используем Кельтский крест.');
+          await runPaidCelticReading(chatId, session, session.reading?.question || 'Посмотреть следующий слой этой истории');
         }
       } else if (callback.data === 'pay:reading' || callback.data === 'pay:celtic') {
         const kind = callback.data === 'pay:celtic' ? 'celtic' : 'reading';
@@ -1908,9 +1992,11 @@ async function handleTelegramUpdate(update) {
         freeConversationUsed: 0,
         paidConversationUsed: 0,
         paidReadingsRemaining: 0,
+        paidCelticRemaining: 0,
         paidReadingActive: false,
         paidPackageKind: 'reading',
         pendingGiftReading: false,
+        pendingPaidReadingKind: '',
         paidContinuation: false,
         readingOfferShown: false,
         pendingReadingQuestion: '',
@@ -1936,12 +2022,28 @@ async function handleTelegramUpdate(update) {
   // in plain text (for example, "Хочу", "Давай", "Да"), go straight to
   // the payment invoice instead of spending another Gemini request on chat.
   const affirmative = /^(да|давай|хочу|конечно|погнали|согласен|согласна|сделаем|смотреть|посмотрим|давай посмотрим|хочу посмотреть|использовать|используем|бери подарок|давай подарок|yes|sure|ok|okay)$/i.test(text);
-  if (session?.pendingGiftReading && session?.paidReadingsRemaining > 0 && affirmative) {
-    session.pendingGiftReading = false;
-    session.pendingReadingQuestion = '';
-    await telegramSendMessage(chatId, 'Тогда используем твой подарок. Посмотрим следующий слой этой истории.');
-    await runPaidThreeCardReading(chatId, session, session.reading?.question || 'Посмотреть следующий слой этой истории');
-    return;
+  if (session?.pendingGiftReading && affirmative) {
+    const preferredKind =
+      session.pendingPaidReadingKind ||
+      (Number(session.paidReadingsRemaining || 0) > 0 ? 'reading' : 'celtic');
+
+    if (preferredKind === 'celtic' && Number(session.paidCelticRemaining || 0) > 0) {
+      session.pendingGiftReading = false;
+      session.pendingPaidReadingKind = '';
+      session.pendingReadingQuestion = '';
+      await telegramSendMessage(chatId, 'Используем Кельтский крест.');
+      await runPaidCelticReading(chatId, session, session.reading?.question || 'Посмотреть следующий слой этой истории');
+      return;
+    }
+
+    if (Number(session.paidReadingsRemaining || 0) > 0) {
+      session.pendingGiftReading = false;
+      session.pendingPaidReadingKind = '';
+      session.pendingReadingQuestion = '';
+      await telegramSendMessage(chatId, 'Используем обычный расклад.');
+      await runPaidThreeCardReading(chatId, session, session.reading?.question || 'Посмотреть следующий слой этой истории');
+      return;
+    }
   }
   if (session?.readingOfferShown && session?.pendingReadingQuestion && !session?.pendingPayment && affirmative) {
     try {
@@ -1954,12 +2056,10 @@ async function handleTelegramUpdate(update) {
   }
 
   // ===== FREE 72-HOUR CONTINUATION =====
-  // After the initial three-message conversation window is exhausted, the next
-  // free entitlement arrives only after 72 hours. That entitlement is a NEW
-  // three-card continuation reading, while keeping the same story/history.
+  // A free three-card continuation becomes available 72 hours after each
+  // completed reading (free or paid). Paid entitlements remain available
+  // independently and never expire by time.
   if (session?.reading &&
-      session.freeConversationUsed >= FREE_CONVERSATION_LIMIT &&
-      Number(session.paidReadingsRemaining || 0) === 0 &&
       !session.pendingGiftReading &&
       Date.now() >= Number(session.freeCooldownAvailableAt || 0)) {
     try {
@@ -2005,8 +2105,9 @@ async function handleTelegramUpdate(update) {
       session.pendingReadingQuestion = '';
       session.readingOfferShown = false;
       session.pendingGiftReading = false;
+      session.pendingPaidReadingKind = '';
       session.freeCooldownUsed = false;
-      session.freeCooldownAvailableAt = 0;
+      session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
       return;
     } catch (err) {
       console.error('[tarot-omen] Free 72-hour continuation reading failed:', err);
@@ -2015,19 +2116,21 @@ async function handleTelegramUpdate(update) {
     }
   }
 
-  // ===== HARD GATE AFTER FREE CONVERSATION WINDOW =====
-  // Once the three free conversation replies are used, NOTHING goes to Gemini
-  // until the user either starts a paid continuation or reaches the 72-hour
-  // entitlement above. This prevents the bot from turning into an unlimited chat.
+  // ===== GATE AFTER THE FREE CONVERSATION WINDOW =====
+  // A completed paid reading has its own paid conversation window, handled above.
+  // Once a free conversation window is exhausted, use an already purchased
+  // reading if one exists. Otherwise show the paid continuation offer.
   if (session?.reading &&
+      session.paidContinuation !== true &&
       session.freeConversationUsed >= FREE_CONVERSATION_LIMIT &&
-      Number(session.paidReadingsRemaining || 0) === 0 &&
       !session.pendingGiftReading) {
-    // This gate must remain active even after /start or a deleted Telegram chat:
-    // the server-side session is intentionally preserved during the test run.
-    // Every blocked user message gets one clear choice: pay now or wait 72h.
-    const offerQuestion = session.pendingReadingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом';
-    await offerPaidContinuation(chatId, session, offerQuestion);
+    if (hasPaidEntitlements(session)) {
+      await offerAvailablePaidReadings(chatId, session);
+    } else {
+      const offerQuestion = session.pendingReadingQuestion ||
+        'Посмотреть следующий слой этой истории отдельным раскладом';
+      await offerPaidContinuation(chatId, session, offerQuestion);
+    }
     return;
   }
 
@@ -2071,12 +2174,12 @@ async function handleTelegramUpdate(update) {
 
     if (session.paidConversationUsed >= PAID_CONVERSATION_LIMIT) {
       session.paidReadingActive = false;
-      session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
-      if (Number(session.paidReadingsRemaining || 0) > 0) {
+      session.paidContinuation = false;
+      if (hasPaidEntitlements(session)) {
         try {
-          await offerGiftReading(chatId, session);
+          await offerAvailablePaidReadings(chatId, session);
         } catch (offerErr) {
-          console.error('[tarot-omen] Gift reading offer delivery failed:', offerErr);
+          console.error('[tarot-omen] Paid reading entitlement offer delivery failed:', offerErr);
         }
       } else {
         session.readingOfferShown = false;
@@ -2142,12 +2245,15 @@ async function handleTelegramUpdate(update) {
     }
 
     if (session.freeConversationUsed >= FREE_CONVERSATION_LIMIT) {
-      session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
-      const offerQuestion = session.pendingReadingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом';
       try {
-        await offerPaidContinuation(chatId, session, offerQuestion);
+        if (hasPaidEntitlements(session)) {
+          await offerAvailablePaidReadings(chatId, session);
+        } else {
+          const offerQuestion = session.pendingReadingQuestion || 'Посмотреть следующий слой этой истории отдельным раскладом';
+          await offerPaidContinuation(chatId, session, offerQuestion);
+        }
       } catch (offerErr) {
-        console.error('[tarot-omen] Paid continuation offer delivery failed:', offerErr);
+        console.error('[tarot-omen] Paid/available reading offer delivery failed:', offerErr);
         // Do not send the generic Gemini error: the conversation reply was already delivered.
       }
     } else {
@@ -2209,16 +2315,18 @@ async function handleTelegramUpdate(update) {
       freeConversationUsed: 0,
       paidConversationUsed: 0,
       paidReadingsRemaining: 0,
+      paidCelticRemaining: 0,
       paidReadingActive: false,
       paidPackageKind: 'reading',
       pendingGiftReading: false,
+      pendingPaidReadingKind: '',
       paidContinuation: PAID_CONTINUATION_DEFAULT,
       readingOfferShown: false,
       pendingReadingQuestion: '',
       pendingPayment: null,
       freeReadingUsed: true,
       freeCooldownUsed: false,
-      freeCooldownAvailableAt: 0
+      freeCooldownAvailableAt: Date.now() + FREE_COOLDOWN_MS
     });
   } catch (err) {
     console.error('[tarot-omen] Telegram reading error:', err);
