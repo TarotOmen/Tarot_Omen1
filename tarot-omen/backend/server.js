@@ -3,6 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import sharp from 'sharp';
 
@@ -13,13 +14,16 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
-// LAVA.TOP card / bank payment integration. No npm package is required.
-const LAVA_API_KEY = process.env.LAVA_API_KEY;
-const LAVA_WEBHOOK_API_KEY = process.env.LAVA_WEBHOOK_API_KEY;
-const LAVA_API_URL = process.env.LAVA_API_URL || 'https://gate.lava.top';
-const LAVA_READING_OFFER_ID = process.env.LAVA_READING_OFFER_ID;
-const LAVA_CELTIC_OFFER_ID = process.env.LAVA_CELTIC_OFFER_ID;
-const LAVA_EMAIL_DOMAIN = process.env.LAVA_EMAIL_DOMAIN || 'omenbot.app';
+// Tribute digital products payment integration.
+const TRIBUTE_API_KEY = process.env.TRIBUTE_API_KEY;
+const TRIBUTE_API_URL = process.env.TRIBUTE_API_URL || 'https://tribute.tg/api/v1';
+const TRIBUTE_READING_PRODUCT_ID = process.env.TRIBUTE_READING_PRODUCT_ID || '';
+const TRIBUTE_CELTIC_PRODUCT_ID = process.env.TRIBUTE_CELTIC_PRODUCT_ID || '';
+const TRIBUTE_READING_PRODUCT_NAME = process.env.TRIBUTE_READING_PRODUCT_NAME || 'Обычный расклад';
+const TRIBUTE_CELTIC_PRODUCT_NAME = process.env.TRIBUTE_CELTIC_PRODUCT_NAME || 'Кельтский крест';
+const TRIBUTE_READING_RUB = Number(process.env.TRIBUTE_READING_RUB || 49);
+const TRIBUTE_CELTIC_RUB = Number(process.env.TRIBUTE_CELTIC_RUB || 99);
+const TRIBUTE_PRODUCT_CACHE_MS = 5 * 60 * 1000;
 const TELEGRAM_WEBHOOK_URL =
   process.env.TELEGRAM_WEBHOOK_URL || 'https://tarot-omen1.onrender.com/telegram-webhook';
 
@@ -29,18 +33,23 @@ if (!GEMINI_API_KEY) {
 if (!TELEGRAM_BOT_TOKEN) {
   console.warn('[tarot-omen] WARNING: TELEGRAM_BOT_TOKEN is not set. Telegram bot will not run.');
 }
-if (!LAVA_API_KEY) {
-  console.warn('[tarot-omen] WARNING: LAVA_API_KEY is not set. Card payments will be unavailable.');
+if (!TRIBUTE_API_KEY) {
+  console.warn('[tarot-omen] WARNING: TRIBUTE_API_KEY is not set. Tribute payments will be unavailable.');
 }
-if (!LAVA_WEBHOOK_API_KEY) {
-  console.warn('[tarot-omen] WARNING: LAVA_WEBHOOK_API_KEY is not set. LAVA payment webhooks will be rejected.');
+if (!Number.isInteger(TRIBUTE_READING_RUB) || TRIBUTE_READING_RUB < 1) {
+  throw new Error('TRIBUTE_READING_RUB must be a positive integer.');
 }
-if (!LAVA_READING_OFFER_ID) {
-  console.warn('[tarot-omen] WARNING: LAVA_READING_OFFER_ID is not set. Card payment links cannot be created.');
+if (!Number.isInteger(TRIBUTE_CELTIC_RUB) || TRIBUTE_CELTIC_RUB < 1) {
+  throw new Error('TRIBUTE_CELTIC_RUB must be a positive integer.');
 }
 
 const app = express();
-app.use(express.json({ limit: '20kb' }));
+app.use(express.json({
+  limit: '20kb',
+  verify: (req, _res, buf) => {
+    req.rawBody = Buffer.from(buf);
+  }
+}));
 app.use(cors({ origin: ALLOWED_ORIGIN }));
 
 const hits = new Map();
@@ -304,7 +313,11 @@ app.post('/api/interpret', async (req, res) => {
   }
 });
 
-app.get('/health', (_req, res) => res.json({ ok: true }));
+app.get('/health', (_req, res) => res.json({
+  ok: true,
+  tributeConfigured: Boolean(TRIBUTE_API_KEY),
+  tributeProductIdsConfigured: Boolean(TRIBUTE_READING_PRODUCT_ID && TRIBUTE_CELTIC_PRODUCT_ID)
+}));
 
 // ===== TAROT DECK =====
 
@@ -690,22 +703,14 @@ const sessions = new Map();
 const PAID_READING_STARS = Number(process.env.PAID_READING_STARS || 49);
 const CELTIC_CROSS_STARS = Number(process.env.CELTIC_CROSS_STARS || 89);
 
-// LAVA.TOP has a minimum one-time price of 50 RUB / 5 USD / 5 EUR.
-// Therefore the card price is 50 RUB (while Telegram Stars can remain 49).
-const LAVA_READING_RUB = Number(process.env.LAVA_READING_RUB || 50);
-const LAVA_READING_USD = Number(process.env.LAVA_READING_USD || 5);
-const LAVA_CELTIC_RUB = Number(process.env.LAVA_CELTIC_RUB || 90);
-const LAVA_CELTIC_USD = Number(process.env.LAVA_CELTIC_USD || 9);
-
 const FREE_CONVERSATION_LIMIT = 3;
 const PAID_CONVERSATION_LIMIT = 3;
 const PAID_READINGS_PER_PACKAGE = 2;
 const FREE_COOLDOWN_MS = 3 * 24 * 60 * 60 * 1000;
 const PAID_CONTINUATION_DEFAULT = false;
 const processedPaymentCharges = new Set();
-const processedLavaPayments = new Set();
-let resolvedLavaReadingOfferId = '';
-let resolvedLavaCelticOfferId = '';
+const processedTributePurchases = new Set();
+const tributeProductCache = new Map();
 
 if (!Number.isInteger(PAID_READING_STARS) || PAID_READING_STARS < 1) {
   throw new Error('PAID_READING_STARS must be a positive integer.');
@@ -1106,235 +1111,357 @@ async function telegramSendSpreadImage(chatId, imageBuffer) {
   }
 }
 
-function lavaSyntheticEmail(chatId, kind) {
-  const safeKind = kind === 'celtic' ? 'celtic' : 'reading';
-  return `omen-${chatId}-${safeKind}@${LAVA_EMAIL_DOMAIN}`;
+function normalizeTributeProductName(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/ё/g, 'е')
+    .replace(/[«»"'`]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
-function extractChatIdFromLavaEmail(email) {
-  const value = String(email || '').trim();
-  const match = value.match(/^omen-(\d+)-(reading|celtic)@/i);
-  return match ? Number(match[1]) : null;
+function tributeExpectedAmount(kind) {
+  return kind === 'celtic' ? TRIBUTE_CELTIC_RUB : TRIBUTE_READING_RUB;
 }
 
-function extractKindFromLavaEmail(email) {
-  const value = String(email || '').trim();
-  const match = value.match(/^omen-(\d+)-(reading|celtic)@/i);
-  return match ? match[2].toLowerCase() : null;
+function tributeConfiguredProductId(kind) {
+  return kind === 'celtic' ? TRIBUTE_CELTIC_PRODUCT_ID : TRIBUTE_READING_PRODUCT_ID;
 }
 
-function findFirstDeepValue(value, keys, depth = 0) {
-  if (depth > 5 || value == null || typeof value !== 'object') return undefined;
-  for (const key of keys) {
-    if (Object.prototype.hasOwnProperty.call(value, key) && value[key] != null) {
-      return value[key];
+function tributeConfiguredProductName(kind) {
+  return kind === 'celtic' ? TRIBUTE_CELTIC_PRODUCT_NAME : TRIBUTE_READING_PRODUCT_NAME;
+}
+
+async function tributeApiRequest(endpoint, options = {}) {
+  if (!TRIBUTE_API_KEY) throw new Error('TRIBUTE_API_KEY is not configured.');
+
+  const response = await fetch(`${TRIBUTE_API_URL}${endpoint}`, {
+    ...options,
+    headers: {
+      Accept: 'application/json',
+      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+      'Api-Key': TRIBUTE_API_KEY,
+      ...(options.headers || {})
     }
-  }
-  for (const child of Object.values(value)) {
-    const found = findFirstDeepValue(child, keys, depth + 1);
-    if (found !== undefined) return found;
-  }
-  return undefined;
-}
-
-
-async function resolveLavaOfferId(kind) {
-  const cached = kind === 'celtic' ? resolvedLavaCelticOfferId : resolvedLavaReadingOfferId;
-  if (cached) return cached;
-  if (!LAVA_API_KEY) throw new Error('LAVA_API_KEY is not configured.');
-
-  const response = await fetch(
-    `${LAVA_API_URL}/api/v2/products?feedVisibility=ALL`,
-    {
-      headers: {
-        Accept: 'application/json',
-        'X-Api-Key': LAVA_API_KEY
-      }
-    }
-  );
+  });
 
   const raw = await response.text();
   let data;
   try {
-    data = JSON.parse(raw);
+    data = raw ? JSON.parse(raw) : null;
   } catch {
-    throw new Error(`LAVA products lookup returned invalid JSON (HTTP ${response.status}).`);
+    throw new Error(`Tribute returned invalid JSON (HTTP ${response.status}).`);
   }
 
   if (!response.ok) {
-    console.error('[tarot-omen] LAVA products lookup failed:', {
+    console.error('[tarot-omen] Tribute API error:', {
       status: response.status,
+      endpoint,
       data
-    });
-    throw new Error(data?.message || data?.error?.message || `LAVA products HTTP ${response.status}`);
-  }
-
-  const target = kind === 'celtic' ? 'кельтский крест' : 'таро-расклад';
-  const products = [];
-
-  const walk = (value, depth = 0) => {
-    if (depth > 6 || value == null || typeof value !== 'object') return;
-    if (Array.isArray(value)) {
-      for (const item of value) walk(item, depth + 1);
-      return;
-    }
-
-    const name = String(
-      value.name ?? value.title ?? value.productName ?? value.contentName ?? ''
-    ).trim().toLowerCase();
-
-    const id = String(
-      value.offerId ?? value.orderId ?? value.id ?? value.productId ?? ''
-    ).trim();
-
-    if (name && id) products.push({ name, id });
-    for (const child of Object.values(value)) walk(child, depth + 1);
-  };
-
-  walk(data);
-
-  const exact = products.find((item) => item.name === target);
-  const partial = products.find((item) => item.name.includes(target));
-  const resolved = exact?.id || partial?.id;
-
-  if (!resolved) {
-    console.error('[tarot-omen] LAVA target product not found:', {
-      target,
-      products: products.slice(0, 50)
-    });
-    throw new Error(`LAVA product "${target}" was not found.`);
-  }
-
-  if (kind === 'celtic') resolvedLavaCelticOfferId = resolved;
-  else resolvedLavaReadingOfferId = resolved;
-
-  console.log(`[tarot-omen] LAVA ${kind} offerId resolved from product feed.`);
-  return resolved;
-}
-
-async function lavaCreateInvoice(chatId, session, kind, currency, paymentMethod = '') {
-  if (!LAVA_API_KEY) {
-    throw new Error('LAVA_API_KEY is not configured.');
-  }
-
-  let offerId = kind === 'celtic' ? LAVA_CELTIC_OFFER_ID : LAVA_READING_OFFER_ID;
-
-  const normalizedCurrency = currency === 'USD' ? 'USD' : 'RUB';
-  const amount = kind === 'celtic'
-    ? (normalizedCurrency === 'USD' ? LAVA_CELTIC_USD : LAVA_CELTIC_RUB)
-    : (normalizedCurrency === 'USD' ? LAVA_READING_USD : LAVA_READING_RUB);
-
-  const email = lavaSyntheticEmail(chatId, kind);
-  const payload = {
-    email,
-    offerId,
-    currency: normalizedCurrency,
-    amount
-  };
-
-  // Keep RUB checkout provider selection on LAVA.
-  // Do not force PAY2ME/paymentMethod here: LAVA's current API exposes the
-  // available RUB methods on the checkout page, and forcing a provider can
-  // make invoice creation fail even when the product itself is valid.
-
-  const createInvoice = async (currentOfferId) => {
-    const response = await fetch(`${LAVA_API_URL}/api/v3/invoice`, {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-        'X-Api-Key': LAVA_API_KEY
-      },
-      body: JSON.stringify({
-        ...payload,
-        offerId: currentOfferId
-      })
-    });
-
-    const raw = await response.text();
-    let data;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      console.error('[tarot-omen] LAVA returned non-JSON response:', {
-        status: response.status,
-        bodyPreview: raw.slice(0, 500)
-      });
-      throw new Error(`LAVA returned invalid JSON (HTTP ${response.status}).`);
-    }
-
-    return { response, data };
-  };
-
-  if (!offerId) {
-    offerId = await resolveLavaOfferId(kind);
-  }
-
-  let result = await createInvoice(offerId);
-
-  // If the configured/dashboard UUID is stale or is not the API offerId,
-  // resolve the hidden API product by its name and retry once.
-  const firstErrorText = String(
-    result.data?.error ||
-    result.data?.message ||
-    result.data?.details?.error ||
-    ''
-  );
-  const looksLikeOfferIdError = /offer.?id|product with offer|product.*not found/i.test(firstErrorText);
-  if (!result.response.ok && (result.response.status === 404 || looksLikeOfferIdError)) {
-    const resolved = await resolveLavaOfferId(kind);
-    if (resolved && resolved !== offerId) {
-      offerId = resolved;
-      result = await createInvoice(offerId);
-    }
-  }
-
-  const response = result.response;
-  const data = result.data;
-
-  if (!response.ok) {
-    console.error('[tarot-omen] LAVA invoice error:', {
-      status: response.status,
-      data,
-      offerId
     });
     throw new Error(
       data?.message ||
       data?.error?.message ||
       data?.error ||
-      `LAVA API HTTP ${response.status}`
+      `Tribute API HTTP ${response.status}`
     );
   }
 
-  const paymentUrl = findFirstDeepValue(data, [
-    'paymentUrl',
-    'payment_url',
-    'invoiceUrl',
-    'invoice_url',
-    'paymentLink',
-    'payment_link',
-    'payUrl',
-    'pay_url',
-    'url'
-  ]);
+  return data;
+}
 
-  if (!paymentUrl) {
-    console.error('[tarot-omen] LAVA invoice response without payment URL:', data);
-    throw new Error('LAVA invoice was created but payment URL was not returned.');
+async function fetchTributeProductById(productId) {
+  const id = String(productId || '').trim();
+  if (!/^\d+$/.test(id)) throw new Error('Invalid Tribute product ID.');
+
+  const cached = tributeProductCache.get(`id:${id}`);
+  if (cached && Date.now() - cached.cachedAt < TRIBUTE_PRODUCT_CACHE_MS) {
+    return cached.product;
   }
 
-  session.pendingLavaPayment = {
-    kind,
-    currency: normalizedCurrency,
-    amount,
-    offerId,
-    paymentMethod: normalizedCurrency === 'RUB' ? (paymentMethod || 'CARD') : '',
-    paymentProvider: paymentMethod === 'SBP' ? 'PAY2ME' : '',
-    email,
+  const product = await tributeApiRequest(`/products/${id}`);
+  tributeProductCache.set(`id:${id}`, { product, cachedAt: Date.now() });
+  return product;
+}
+
+async function fetchTributeDigitalProducts() {
+  const data = await tributeApiRequest('/products?type=digital&size=100&desc=true');
+  const rows = Array.isArray(data?.rows) ? data.rows : [];
+  return rows;
+}
+
+function validateTributeProduct(product, kind) {
+  if (!product || String(product.type || '').toLowerCase() !== 'digital') {
+    throw new Error(`Tribute product for ${kind} must be a digital product.`);
+  }
+  if (String(product.status || '').toLowerCase() !== 'approved') {
+    throw new Error(`Tribute product for ${kind} is not approved yet.`);
+  }
+  if (String(product.currency || '').toLowerCase() !== 'rub') {
+    throw new Error(`Tribute product for ${kind} must use RUB.`);
+  }
+
+  const expected = tributeExpectedAmount(kind) * 100;
+  const actual = Number(product.amount);
+  if (!Number.isInteger(actual) || actual !== expected) {
+    throw new Error(
+      `Tribute product price mismatch for ${kind}: expected ${expected} kopecks, got ${actual}.`
+    );
+  }
+
+  const paymentUrl = product.link || product.webLink;
+  if (typeof paymentUrl !== 'string' || !/^https:\/\//i.test(paymentUrl)) {
+    throw new Error(`Tribute product for ${kind} has no payment link.`);
+  }
+
+  return product;
+}
+
+async function resolveTributeProduct(kind) {
+  const configuredId = tributeConfiguredProductId(kind);
+  if (configuredId) {
+    const product = await fetchTributeProductById(configuredId);
+    return validateTributeProduct(product, kind);
+  }
+
+  const products = await fetchTributeDigitalProducts();
+  const wanted = normalizeTributeProductName(tributeConfiguredProductName(kind));
+  const targetWords = wanted.split(' ').filter((word) => word.length >= 4);
+
+  const candidates = products
+    .filter((product) => String(product.status || '').toLowerCase() === 'approved')
+    .filter((product) => String(product.currency || '').toLowerCase() === 'rub')
+    .filter((product) => Number(product.amount) === tributeExpectedAmount(kind) * 100);
+
+  const exact = candidates.find(
+    (product) => normalizeTributeProductName(product.name) === wanted
+  );
+  if (exact) return validateTributeProduct(exact, kind);
+
+  const partial = candidates.find((product) => {
+    const name = normalizeTributeProductName(product.name);
+    return targetWords.length > 0 && targetWords.every((word) => name.includes(word));
+  });
+  if (partial) return validateTributeProduct(partial, kind);
+
+  // When the creator has only one approved RUB digital product at the expected
+  // price, use it even if its human-facing name differs from our default. This
+  // keeps the integration from depending on a particular product title.
+  if (candidates.length === 1) return validateTributeProduct(candidates[0], kind);
+
+  throw new Error(
+    `Approved Tribute digital product for ${kind} (${tributeConfiguredProductName(kind)}, ${tributeExpectedAmount(kind)} RUB) was not found.`
+  );
+}
+
+async function getTributePaymentUrl(kind) {
+  const product = await resolveTributeProduct(kind);
+  return {
+    url: product.link || product.webLink,
+    productId: String(product.id),
+    amountRub: tributeExpectedAmount(kind),
+    productName: product.name
+  };
+}
+
+function verifyTributeSignature(req) {
+  if (!TRIBUTE_API_KEY) return false;
+  const signatureHeader = String(req.get('trbt-signature') || '').trim();
+  if (!signatureHeader || !Buffer.isBuffer(req.rawBody)) return false;
+
+  const provided = signatureHeader.replace(/^sha256=/i, '').trim();
+  const digestHex = crypto
+    .createHmac('sha256', TRIBUTE_API_KEY)
+    .update(req.rawBody)
+    .digest('hex');
+  const digestBase64 = crypto
+    .createHmac('sha256', TRIBUTE_API_KEY)
+    .update(req.rawBody)
+    .digest('base64');
+
+  const safeEqual = (left, right) => {
+    const a = Buffer.from(left, 'utf8');
+    const b = Buffer.from(right, 'utf8');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  };
+
+  return safeEqual(provided, digestHex) || safeEqual(provided, digestBase64);
+}
+
+function extractTributeEventPayload(body) {
+  const payload = body?.payload;
+  if (!payload || typeof payload !== 'object') return null;
+
+  const telegramUserId = payload.telegram_user_id ?? payload.telegramUserId;
+  const productId = payload.product_id ?? payload.productId;
+  const purchaseId = payload.purchase_id ?? payload.purchaseId;
+  const transactionId = payload.transaction_id ?? payload.transactionId;
+
+  return {
+    telegramUserId: telegramUserId != null ? String(telegramUserId) : '',
+    productId: productId != null ? String(productId) : '',
+    purchaseId: purchaseId != null ? String(purchaseId) : '',
+    transactionId: transactionId != null ? String(transactionId) : '',
+    amount: Number(payload.amount),
+    currency: String(payload.currency || '').toLowerCase(),
+    productName: String(payload.product_name || payload.productName || ''),
+    raw: payload
+  };
+}
+
+async function resolveTributeKindByProductId(productId) {
+  const id = String(productId || '').trim();
+  if (!id) return null;
+
+  const configuredReading = String(TRIBUTE_READING_PRODUCT_ID || '').trim();
+  const configuredCeltic = String(TRIBUTE_CELTIC_PRODUCT_ID || '').trim();
+  if (configuredReading && id === configuredReading) return 'reading';
+  if (configuredCeltic && id === configuredCeltic) return 'celtic';
+
+  for (const kind of ['reading', 'celtic']) {
+    try {
+      const product = await resolveTributeProduct(kind);
+      if (String(product.id) === id) return kind;
+    } catch (err) {
+      console.warn(`[tarot-omen] Could not resolve Tribute ${kind} product from webhook:`, err?.message);
+    }
+  }
+
+  return null;
+}
+
+async function handleTributeWebhook(body) {
+  const eventName = String(body?.name || '').toLowerCase();
+  const eventPayload = extractTributeEventPayload(body);
+
+  if (eventName === 'digital_product_refunded') {
+    if (!eventPayload?.purchaseId || !eventPayload.telegramUserId) return;
+    const session = sessions.get(Number(eventPayload.telegramUserId));
+    if (!session) return;
+    if (String(session.lastTributePurchaseId || '') !== eventPayload.purchaseId) return;
+
+    session.paidReadingsRemaining = 0;
+    session.pendingGiftReading = false;
+    session.pendingPayment = null;
+    session.pendingTributePayment = null;
+    console.log('[tarot-omen] Tribute refund processed:', eventPayload.purchaseId);
+    return;
+  }
+
+  if (eventName !== 'new_digital_product' || !eventPayload) return;
+
+  const purchaseKey = eventPayload.purchaseId || eventPayload.transactionId;
+  if (!purchaseKey || !eventPayload.telegramUserId || !eventPayload.productId) {
+    console.warn('[tarot-omen] Tribute purchase webhook missing required identifiers.', eventPayload);
+    return;
+  }
+
+  if (processedTributePurchases.has(purchaseKey)) return;
+
+  const kind = await resolveTributeKindByProductId(eventPayload.productId);
+  if (!kind) {
+    console.warn('[tarot-omen] Tribute purchase product is not configured for Omen:', eventPayload.productId);
+    return;
+  }
+
+  if (eventPayload.currency && eventPayload.currency !== 'rub') {
+    console.warn('[tarot-omen] Tribute purchase currency mismatch:', eventPayload);
+    return;
+  }
+
+  const expectedAmount = tributeExpectedAmount(kind) * 100;
+  if (Number.isFinite(eventPayload.amount) && eventPayload.amount !== expectedAmount) {
+    console.warn('[tarot-omen] Tribute purchase amount mismatch:', {
+      kind,
+      expectedAmount,
+      actual: eventPayload.amount
+    });
+    return;
+  }
+
+  processedTributePurchases.add(purchaseKey);
+
+  const chatId = Number(eventPayload.telegramUserId);
+  if (!Number.isSafeInteger(chatId) || chatId <= 0) {
+    console.warn('[tarot-omen] Tribute webhook contained invalid Telegram user ID:', eventPayload.telegramUserId);
+    return;
+  }
+
+  let session = sessions.get(chatId);
+  if (!session) {
+    session = {
+      userName: eventPayload.raw?.telegram_username || '',
+      reading: null,
+      history: [],
+      freeConversationUsed: FREE_CONVERSATION_LIMIT,
+      paidConversationUsed: 0,
+      paidReadingsRemaining: 0,
+      paidReadingActive: false,
+      paidPackageKind: 'reading',
+      pendingGiftReading: false,
+      paidContinuation: false,
+      readingOfferShown: false,
+      pendingReadingQuestion: '',
+      pendingPayment: null,
+      pendingTributePayment: null,
+      freeReadingUsed: true,
+      freeCooldownAvailableAt: Date.now()
+    };
+    sessions.set(chatId, session);
+  }
+
+  const pending = session.pendingTributePayment;
+  if (pending && String(pending.productId) !== String(eventPayload.productId)) {
+    console.warn('[tarot-omen] Tribute purchase does not match the pending Omen payment.', {
+      pendingProductId: pending.productId,
+      webhookProductId: eventPayload.productId,
+      chatId
+    });
+    return;
+  }
+
+  const question = session.pendingReadingQuestion || session.reading?.question ||
+    'Посмотреть следующий слой этой истории';
+
+  session.pendingTributePayment = null;
+  session.pendingPayment = null;
+  session.lastTributePurchaseId = purchaseKey;
+  activatePaidPackage(session, kind);
+
+  if (kind === 'celtic') {
+    await telegramSendMessage(chatId, 'Оплата прошла. Запускаю Кельтский крест — 10 карт и подробный разбор.');
+    await runPaidCelticReading(chatId, session, question);
+    return;
+  }
+
+  await telegramSendMessage(chatId, 'Оплата прошла. В пакет входят два расклада: один сейчас и ещё один — в подарок. Начинаем первый.');
+  await runPaidThreeCardReading(chatId, session, question);
+}
+
+async function createTributePayment(chatId, session, kind) {
+  if (!session?.reading) {
+    await telegramSendMessage(chatId, 'Сначала нужен расклад, с которого начнём эту историю.');
+    return;
+  }
+
+  const safeKind = kind === 'celtic' ? 'celtic' : 'reading';
+  const { url, productId } = await getTributePaymentUrl(safeKind);
+
+  session.pendingTributePayment = {
+    kind: safeKind,
+    productId,
+    readingQuestion: session.pendingReadingQuestion || session.reading.question,
+    amountRub: tributeExpectedAmount(safeKind),
     createdAt: Date.now()
   };
 
-  return paymentUrl;
+  await telegramSendPaymentUrl(
+    chatId,
+    safeKind === 'celtic'
+      ? 'Открыл оплату Кельтского креста. После успешной оплаты Omen автоматически продолжит историю.'
+      : 'Открыл оплату. После успешной оплаты Omen автоматически продолжит историю.',
+    url
+  );
 }
 
 async function telegramSendPaymentUrl(chatId, text, url) {
@@ -1361,9 +1488,7 @@ function buildPaidContinuationText() {
 function buildPaidContinuationButtons() {
   return [
     [{ text: `⭐ Обычный — ${PAID_READING_STARS} Stars`, callback_data: 'pay:stars:reading' }],
-    [{ text: `💳 Обычный — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB:CARD' }],
-    [{ text: `🏦 Обычный СБП — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB:SBP' }],
-    [{ text: `🌍 Обычный — $${LAVA_READING_USD}`, callback_data: 'pay:lava:reading:USD' }],
+    [{ text: `💳 Карта / СБП — ${TRIBUTE_READING_RUB} ₽`, callback_data: 'pay:tribute:reading' }],
     [{ text: '🔮 Кельтский крест — 10 карт', callback_data: 'choose:celtic:payment' }]
   ];
 }
@@ -1394,9 +1519,7 @@ async function offerCelticPaymentMethods(chatId, messageId) {
     'Кельтский крест — 10 карт. Выбери способ оплаты:',
     [
       [{ text: `⭐ Telegram Stars — ${CELTIC_CROSS_STARS}`, callback_data: 'pay:stars:celtic' }],
-      [{ text: `💳 Карта — ${LAVA_CELTIC_RUB} ₽`, callback_data: 'pay:lava:celtic:RUB:CARD' }],
-      [{ text: `🏦 СБП — ${LAVA_CELTIC_RUB} ₽`, callback_data: 'pay:lava:celtic:RUB:SBP' }],
-      [{ text: `🌍 Зарубежная карта — $${LAVA_CELTIC_USD}`, callback_data: 'pay:lava:celtic:USD' }],
+      [{ text: `💳 Карта / СБП — ${TRIBUTE_CELTIC_RUB} ₽`, callback_data: 'pay:tribute:celtic' }],
       [{ text: '⬅️ Вернуться к обычному раскладу', callback_data: 'choose:celtic:back' }]
     ]
   );
@@ -1413,100 +1536,26 @@ async function offerGiftReading(chatId, session) {
   );
 }
 
-async function handleLavaWebhook(body) {
-  const event = String(
-    findFirstDeepValue(body, ['event', 'eventType', 'type']) || ''
-  ).toLowerCase();
-  const status = String(
-    findFirstDeepValue(body, ['status', 'contractStatus']) || ''
-  ).toLowerCase();
-
-  const isSuccess =
-    event === 'payment.success' ||
-    event === 'payment_success' ||
-    event === 'success' ||
-    status === 'success';
-
-  if (!isSuccess) return;
-
-  const email = findFirstDeepValue(body, ['email', 'buyerEmail', 'customerEmail']);
-  const chatId = extractChatIdFromLavaEmail(email);
-  const kindFromEmail = extractKindFromLavaEmail(email);
-  if (!chatId || !kindFromEmail) {
-    console.warn('[tarot-omen] LAVA payment received but chat ID could not be extracted:', body);
-    return;
-  }
-
-  const invoiceId = String(
-    findFirstDeepValue(body, ['invoiceId', 'invoiceID', 'id', 'contractId']) ||
-    `${email}:${findFirstDeepValue(body, ['amount']) || ''}:${findFirstDeepValue(body, ['createdAt']) || ''}`
-  );
-  if (processedLavaPayments.has(invoiceId)) return;
-  processedLavaPayments.add(invoiceId);
-
-  let session = sessions.get(chatId);
-  if (!session) {
-    session = {
-      userName: '',
-      reading: null,
-      history: [],
-      freeConversationUsed: FREE_CONVERSATION_LIMIT,
-      paidConversationUsed: 0,
-      paidReadingsRemaining: 0,
-      paidReadingActive: false,
-      paidPackageKind: 'reading',
-      pendingGiftReading: false,
-      paidContinuation: false,
-      readingOfferShown: false,
-      pendingReadingQuestion: '',
-      pendingPayment: null,
-      pendingLavaPayment: null,
-      freeReadingUsed: true,
-      freeCooldownAvailableAt: Date.now()
-    };
-    sessions.set(chatId, session);
-  }
-
-  const pending = session.pendingLavaPayment;
-  if (pending && pending.kind !== kindFromEmail) {
-    console.warn('[tarot-omen] LAVA payment kind mismatch. Ignoring webhook.');
-    return;
-  }
-
-  const question = session.pendingReadingQuestion || session.reading?.question ||
-    'Посмотреть следующий слой этой истории';
-
-  session.pendingLavaPayment = null;
-  activatePaidPackage(session, kindFromEmail);
-
-  if (kindFromEmail === 'celtic') {
-    await telegramSendMessage(chatId, 'Оплата прошла. Запускаю Кельтский крест — 10 карт и подробный разбор.');
-    await runPaidCelticReading(chatId, session, question);
-    return;
-  }
-
-  await telegramSendMessage(chatId, 'Оплата прошла. В пакет входят два расклада: один сейчас и ещё один — в подарок. Начинаем первый.');
-  await runPaidThreeCardReading(chatId, session, question);
-}
-
-async function createPaymentInvoice(chatId, session, kind, currency = 'RUB', paymentMethod = '') {
+async function createPaymentInvoice(chatId, session, kind, currency = 'STARS') {
   if (!session?.reading) {
     await telegramSendMessage(chatId, 'Сначала нужен расклад, с которого начнём эту историю.');
     return;
   }
 
   const safeKind = kind === 'celtic' ? 'celtic' : 'reading';
-  const isCeltic = safeKind === 'celtic';
-  const payload = `omen:${safeKind}:${chatId}:${Date.now()}`;
-  session.pendingPayment = {
-    payload,
-    kind: safeKind,
-    readingQuestion: session.pendingReadingQuestion || session.reading.question,
-    stars: isCeltic ? CELTIC_CROSS_STARS : PAID_READING_STARS,
-    createdAt: Date.now()
-  };
 
   if (currency === 'STARS') {
+    const isCeltic = safeKind === 'celtic';
+    const payload = `omen:${safeKind}:${chatId}:${Date.now()}`;
+    session.pendingTributePayment = null;
+    session.pendingPayment = {
+      payload,
+      kind: safeKind,
+      readingQuestion: session.pendingReadingQuestion || session.reading.question,
+      stars: isCeltic ? CELTIC_CROSS_STARS : PAID_READING_STARS,
+      createdAt: Date.now()
+    };
+
     await telegramSendInvoice(chatId, {
       title: isCeltic ? 'Кельтский крест' : 'Продолжение расклада',
       description: isCeltic
@@ -1518,22 +1567,7 @@ async function createPaymentInvoice(chatId, session, kind, currency = 'RUB', pay
     return;
   }
 
-  const paymentUrl = await lavaCreateInvoice(chatId, session, safeKind, currency, paymentMethod);
-  await telegramSendPaymentUrl(
-    chatId,
-    isCeltic
-      ? currency === 'USD'
-        ? 'Открыл оплату Кельтского креста зарубежной картой. После успешной оплаты Omen автоматически продолжит историю.'
-        : paymentMethod === 'SBP'
-          ? 'Открыл оплату Кельтского креста через СБП. После успешной оплаты Omen автоматически продолжит историю.'
-          : 'Открыл оплату Кельтского креста банковской картой. После успешной оплаты Omen автоматически продолжит историю.'
-      : currency === 'USD'
-        ? 'Открыл оплату зарубежной картой. После успешной оплаты Omen автоматически продолжит историю.'
-        : paymentMethod === 'SBP'
-          ? 'Открыл оплату через СБП. После успешной оплаты Omen автоматически продолжит историю.'
-          : 'Открыл оплату банковской картой. После успешной оплаты Omen автоматически продолжит историю.',
-    paymentUrl
-  );
+  await createTributePayment(chatId, session, safeKind);
 }
 
 function activatePaidPackage(session, kind = 'reading') {
@@ -1576,7 +1610,7 @@ async function handleSuccessfulPayment(message) {
 
   const pending = session.pendingPayment;
   session.pendingPayment = null;
-  session.pendingLavaPayment = null;
+  session.pendingTributePayment = null;
   activatePaidPackage(session, pending.kind || 'reading');
 
   if (pending.kind === 'celtic') {
@@ -1614,7 +1648,7 @@ async function handlePreCheckoutQuery(query) {
   await telegramAnswerPreCheckoutQuery(query.id, true);
 }
 
-async function runPaidCelticReading(chatId, session, question, options = {}) {
+async function runPaidCelticReading(chatId, session, question) {
   const userName = session.userName || '';
   const cards = drawCelticCrossCards();
   const previousReading = session.reading?.spreadType === 'three' ? session.reading : null;
@@ -1661,8 +1695,7 @@ async function runPaidCelticReading(chatId, session, question, options = {}) {
       question,
       cards,
       interpretation: result.interpretation,
-      spreadType: 'celtic',
-      isCelticTest: options.test === true
+      spreadType: 'celtic'
     };
     session.history = Array.isArray(session.history) ? session.history.slice(-24) : [];
     session.paidConversationUsed = 0;
@@ -1676,7 +1709,7 @@ async function runPaidCelticReading(chatId, session, question, options = {}) {
     session.freeCooldownUsed = false;
     session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
     session.pendingPayment = null;
-    session.pendingLavaPayment = null;
+    session.pendingTributePayment = null;
   } catch (err) {
     console.error('[tarot-omen] Celtic reading error:', err);
     await telegramSendMessage(chatId, 'Не удалось получить Кельтский крест. Оплата сохранена за этой историей — попробуй ещё раз.');
@@ -1791,20 +1824,10 @@ async function handleTelegramUpdate(update) {
         await createPaymentInvoice(chatId, session, 'reading', 'STARS');
       } else if (callback.data === 'pay:stars:celtic') {
         await createPaymentInvoice(chatId, session, 'celtic', 'STARS');
-      } else if (callback.data === 'pay:lava:reading:RUB:CARD') {
-        await createPaymentInvoice(chatId, session, 'reading', 'RUB', 'CARD');
-      } else if (callback.data === 'pay:lava:reading:RUB:SBP') {
-        await createPaymentInvoice(chatId, session, 'reading', 'RUB', 'SBP');
-      } else if (callback.data === 'pay:lava:celtic:RUB:CARD') {
-        await createPaymentInvoice(chatId, session, 'celtic', 'RUB', 'CARD');
-      } else if (callback.data === 'pay:lava:celtic:RUB:SBP') {
-        await createPaymentInvoice(chatId, session, 'celtic', 'RUB', 'SBP');
-      } else if (callback.data === 'pay:lava:reading:RUB') {
-        await createPaymentInvoice(chatId, session, 'reading', 'RUB', 'CARD');
-      } else if (callback.data === 'pay:lava:reading:USD') {
-        await createPaymentInvoice(chatId, session, 'reading', 'USD');
-      } else if (callback.data === 'pay:lava:celtic:USD') {
-        await createPaymentInvoice(chatId, session, 'celtic', 'USD');
+      } else if (callback.data === 'pay:tribute:reading') {
+        await createTributePayment(chatId, session, 'reading');
+      } else if (callback.data === 'pay:tribute:celtic') {
+        await createTributePayment(chatId, session, 'celtic');
       } else if (callback.data === 'gift:reading') {
         if (session?.pendingGiftReading && session?.paidReadingsRemaining > 0) {
           session.pendingGiftReading = false;
@@ -1880,7 +1903,7 @@ async function handleTelegramUpdate(update) {
         readingOfferShown: false,
         pendingReadingQuestion: '',
         pendingPayment: null,
-        pendingLavaPayment: null,
+        pendingTributePayment: null,
         freeReadingUsed: false,
         freeCooldownAvailableAt: 0
       });
@@ -2181,6 +2204,7 @@ async function handleTelegramUpdate(update) {
       readingOfferShown: false,
       pendingReadingQuestion: '',
       pendingPayment: null,
+      pendingTributePayment: null,
       freeReadingUsed: true,
       freeCooldownUsed: false,
       freeCooldownAvailableAt: 0
@@ -2195,18 +2219,17 @@ async function handleTelegramUpdate(update) {
   }
 }
 
-app.post('/lava-webhook', (req, res) => {
-  const providedKey = String(req.get('X-Api-Key') || '');
-  if (!LAVA_WEBHOOK_API_KEY || providedKey !== LAVA_WEBHOOK_API_KEY) {
+app.post('/tribute-webhook', (req, res) => {
+  if (!verifyTributeSignature(req)) {
     return res.sendStatus(401);
   }
 
-  // Acknowledge quickly. LAVA retries non-2xx responses, so all processing is
-  // intentionally performed after the 200 response.
-  res.sendStatus(200);
+  // Tribute retries failed webhooks. Acknowledge an authenticated request quickly,
+  // then process it without making Tribute wait for Gemini/Telegram work.
+  res.status(200).json({ status: 'ok' });
 
-  handleLavaWebhook(req.body).catch((err) => {
-    console.error('[tarot-omen] LAVA webhook handler error:', err);
+  handleTributeWebhook(req.body).catch((err) => {
+    console.error('[tarot-omen] Tribute webhook handler error:', err);
   });
 });
 
