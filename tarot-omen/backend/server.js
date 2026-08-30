@@ -37,8 +37,6 @@ if (!TRIBUTE_CELTIC_PRODUCT_ID) {
   console.warn('[tarot-omen] WARNING: TRIBUTE_CELTIC_PRODUCT_ID is not set. Celtic Tribute payment cannot be opened.');
 }
 
-console.log(`[tarot-omen] Telegram Stars payments: ${Number.isInteger(PAID_READING_STARS) && PAID_READING_STARS >= 1 && Number.isInteger(CELTIC_CROSS_STARS) && CELTIC_CROSS_STARS >= 1 ? 'ready' : 'misconfigured'}.`);
-
 const app = express();
 app.use(express.json({
   limit: '50kb',
@@ -694,6 +692,8 @@ async function buildCelticCrossImage(cards) {
 const sessions = new Map();
 const PAID_READING_STARS = Number(process.env.PAID_READING_STARS || 49);
 const CELTIC_CROSS_STARS = Number(process.env.CELTIC_CROSS_STARS || 89);
+
+console.log(`[tarot-omen] Telegram Stars configured: reading=${PAID_READING_STARS}, celtic=${CELTIC_CROSS_STARS}`);
 
 const TRIBUTE_READING_RUB = 49;
 const TRIBUTE_CELTIC_RUB = 99;
