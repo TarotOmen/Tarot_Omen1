@@ -714,7 +714,7 @@ You are now having a short, personal conversation about that reading.
 Rules:
 - Understand the original question, all cards in the completed spread, the original interpretation, the conversation history and the latest user message.
 - Answer the latest message directly. Do not generate a new Tarot reading in this stage.
-- Be natural, perceptive, warm and concise. Usually 1-3 short paragraphs.
+- Be natural, perceptive and warm, like a thoughtful human Tarot reader who is genuinely talking with one person. Do not rush to the conclusion. Usually write 3-5 substantive short paragraphs, with enough detail to explain the thought, connect it to the user's situation and make the conversation feel alive. The explanation should feel conversational rather than like a compact AI answer.
 - Never invent facts about the user's life.
 - Never claim certainty about the future.
 - Never assume or mention gender. Use the Telegram first name only when it sounds natural.
@@ -728,14 +728,17 @@ Rules:
 {"reply":"...","next_message":"...","next_message_type":"question","reading_offer":false,"reading_question":""}
 
 Rules for next_message:
-- After EVERY reply, provide either a short context-specific question OR a short concluding thought. Never leave the reply hanging without one of these.
+- After EVERY reply, provide either ONE short context-specific question OR ONE short concluding thought. Never leave the reply hanging without one of these. The question/conclusion is separate from the main explanation and does not replace it.
 - next_message_type must be exactly "question" or "conclusion".
 - Use "question" when there is a natural, meaningful thing the user can answer that deepens the conversation.
 - Use "conclusion" when the user's latest message closes the current thought, or when another question would feel forced. The conclusion should feel complete, not like a sales message.
 - The next_message is sent as a SEPARATE Telegram message.
 - Never mention payment, credits, limits or sales in next_message.
 - Do not ask a generic question. Connect it to the actual conversation and the reading.
-- Do not repeat the same question or simply rephrase the user's last message.`;
+- Do not repeat the same question or simply rephrase the user's last message.
+- Keep the conversation naturally focused on the current reading. Ask no more than one new question per reply.
+- The user has up to three conversational turns after a completed reading. Use those turns to deepen the existing reading, clarify what matters, and respond to what the user actually says. If the user already understands the point or closes the thought, use a conclusion earlier instead of forcing another question.
+- Do not compress a meaningful explanation just to be brief. Prefer a fuller, human-sounding explanation when the user's message gives you enough material for it.`;
 
 async function generateConversationResponse({ userName, originalQuestion, cards, interpretation, history, latestMessage, conversationUsed = 0, conversationLimit = FREE_CONVERSATION_LIMIT, spreadType = 'three' }) {
   if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not configured on the server.');
@@ -769,7 +772,7 @@ async function generateConversationResponse({ userName, originalQuestion, cards,
           body: JSON.stringify({
             systemInstruction: { parts: [{ text: CONVERSATION_SYSTEM_PROMPT }] },
             contents: [{ role: 'user', parts: [{ text: userMessage }] }],
-            generationConfig: { maxOutputTokens: 1000, responseMimeType: 'application/json' }
+            generationConfig: { maxOutputTokens: 1700, responseMimeType: 'application/json' }
           }),
           signal: controller.signal
         }
@@ -799,7 +802,7 @@ async function generateConversationResponse({ userName, originalQuestion, cards,
         const cleaned = generated.replace(/^```json\\s*/i, '').replace(/^```\\s*/i, '').replace(/\\s*```$/i, '').trim();
         result = JSON.parse(cleaned);
       }
-      const reply = capText(typeof result?.reply === 'string' ? result.reply.trim() : '', 1800);
+      const reply = capText(typeof result?.reply === 'string' ? result.reply.trim() : '', 3000);
       const nextMessage = capText(
         typeof result?.next_message === 'string' ? result.next_message.trim() : '',
         500
