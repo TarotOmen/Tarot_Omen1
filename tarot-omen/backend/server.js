@@ -986,6 +986,35 @@ async function telegramEditInlineKeyboardWithRetry(chatId, messageId, buttons, a
   throw lastError || new Error('Telegram keyboard edit failed.');
 }
 
+async function telegramEditMessageText(chatId, messageId, text, buttons = []) {
+  const response = await fetch(`${TELEGRAM_API}/editMessageText`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      reply_markup: { inline_keyboard: buttons }
+    })
+  });
+  if (!response.ok) {
+    throw new Error(`Telegram editMessageText failed: ${await response.text()}`);
+  }
+}
+
+async function telegramEditMessageTextWithRetry(chatId, messageId, text, buttons = [], attempts = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await telegramEditMessageText(chatId, messageId, text, buttons);
+    } catch (err) {
+      lastError = err;
+      if (attempt < attempts) await sleep(attempt * 700);
+    }
+  }
+  throw lastError || new Error('Telegram message edit failed.');
+}
+
 async function telegramSendOracle(chatId) {
   const imageBuffer = await readFile(ORACLE_IMAGE_PATH);
 
@@ -1203,12 +1232,10 @@ async function lavaCreateInvoice(chatId, session, kind, currency, paymentMethod 
     amount
   };
 
-  // Russian card payments keep Lava's default RUB provider (SMART_GLOCAL).
-  // SBP is explicitly routed through PAY2ME using paymentMethod=SBP.
-  if (normalizedCurrency === 'RUB' && paymentMethod === 'SBP') {
-    payload.paymentProvider = 'PAY2ME';
-    payload.paymentMethod = 'SBP';
-  }
+  // Keep RUB checkout provider selection on LAVA.
+  // Do not force PAY2ME/paymentMethod here: LAVA's current API exposes the
+  // available RUB methods on the checkout page, and forcing a provider can
+  // make invoice creation fail even when the product itself is valid.
 
   const createInvoice = async (currentOfferId) => {
     const response = await fetch(`${LAVA_API_URL}/api/v3/invoice`, {
@@ -1245,16 +1272,18 @@ async function lavaCreateInvoice(chatId, session, kind, currency, paymentMethod 
 
   let result = await createInvoice(offerId);
 
-  // If the dashboard UUID isn't the Public API offerId, resolve the actual
-  // hidden API product and retry once.
-  if (
-    result.response.status === 404 &&
-    /Product with offer id/i.test(
-      String(result.data?.error || result.data?.message || result.data?.details?.error || '')
-    )
-  ) {
+  // If the configured/dashboard UUID is stale or is not the API offerId,
+  // resolve the hidden API product by its name and retry once.
+  const firstErrorText = String(
+    result.data?.error ||
+    result.data?.message ||
+    result.data?.details?.error ||
+    ''
+  );
+  const looksLikeOfferIdError = /offer.?id|product with offer|product.*not found/i.test(firstErrorText);
+  if (!result.response.ok && (result.response.status === 404 || looksLikeOfferIdError)) {
     const resolved = await resolveLavaOfferId(kind);
-    if (resolved !== offerId) {
+    if (resolved && resolved !== offerId) {
       offerId = resolved;
       result = await createInvoice(offerId);
     }
@@ -1325,7 +1354,21 @@ async function telegramSendPaymentUrl(chatId, text, url) {
   }
 }
 
-async function offerPaidContinuation(chatId, session, readingQuestion = '') {
+function buildPaidContinuationText() {
+  return 'Если хочешь продолжить эту историю сейчас, есть два варианта. Обычный расклад — 3 карты, чтобы посмотреть следующий слой ситуации. Или расширенный — Кельтский крест из 10 карт: он даст более глубокое погружение и позволит посмотреть ситуацию с многих сторон. Для обычного расклада после оплаты ты получишь два расклада: один сейчас и ещё один — в подарок. Кельтский крест — отдельный расширенный расклад.';
+}
+
+function buildPaidContinuationButtons() {
+  return [
+    [{ text: `⭐ Обычный — ${PAID_READING_STARS} Stars`, callback_data: 'pay:stars:reading' }],
+    [{ text: `💳 Обычный — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB:CARD' }],
+    [{ text: `🏦 Обычный СБП — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB:SBP' }],
+    [{ text: `🌍 Обычный — $${LAVA_READING_USD}`, callback_data: 'pay:lava:reading:USD' }],
+    [{ text: '🔮 Кельтский крест — 10 карт', callback_data: 'choose:celtic:payment' }]
+  ];
+}
+
+async function offerPaidContinuation(chatId, session, readingQuestion = '', messageId = null) {
   const question = (readingQuestion || '').trim() ||
     'Посмотреть следующий слой этой истории отдельным раскладом';
 
@@ -1333,28 +1376,28 @@ async function offerPaidContinuation(chatId, session, readingQuestion = '') {
   session.readingOfferShown = true;
   session.pendingGiftReading = false;
 
-  await telegramSendInlineKeyboardWithRetry(
-    chatId,
-    'Если хочешь продолжить эту историю сейчас, есть два варианта. Обычный расклад — 3 карты, чтобы посмотреть следующий слой ситуации. Или расширенный — Кельтский крест из 10 карт: он даст более глубокое погружение и позволит посмотреть ситуацию с многих сторон. Для обычного расклада после оплаты ты получишь два расклада: один сейчас и ещё один — в подарок. Кельтский крест — отдельный расширенный расклад.',
-    [
-      [{ text: `⭐ Обычный — ${PAID_READING_STARS} Stars`, callback_data: 'pay:stars:reading' }],
-      [{ text: `💳 Обычный — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB:CARD' }],
-      [{ text: `🏦 Обычный СБП — ${LAVA_READING_RUB} ₽`, callback_data: 'pay:lava:reading:RUB:SBP' }],
-      [{ text: `🌍 Обычный — $${LAVA_READING_USD}`, callback_data: 'pay:lava:reading:USD' }],
-      [{ text: '🔮 Кельтский крест — 10 карт', callback_data: 'choose:celtic:payment' }]
-    ]
-  );
+  const text = buildPaidContinuationText();
+  const buttons = buildPaidContinuationButtons();
+
+  if (messageId) {
+    await telegramEditMessageTextWithRetry(chatId, messageId, text, buttons);
+    return;
+  }
+
+  await telegramSendInlineKeyboardWithRetry(chatId, text, buttons);
 }
 
 async function offerCelticPaymentMethods(chatId, messageId) {
-  await telegramEditInlineKeyboardWithRetry(
+  await telegramEditMessageTextWithRetry(
     chatId,
     messageId,
+    'Кельтский крест — 10 карт. Выбери способ оплаты:',
     [
       [{ text: `⭐ Telegram Stars — ${CELTIC_CROSS_STARS}`, callback_data: 'pay:stars:celtic' }],
       [{ text: `💳 Карта — ${LAVA_CELTIC_RUB} ₽`, callback_data: 'pay:lava:celtic:RUB:CARD' }],
       [{ text: `🏦 СБП — ${LAVA_CELTIC_RUB} ₽`, callback_data: 'pay:lava:celtic:RUB:SBP' }],
-      [{ text: `🌍 Зарубежная карта — $${LAVA_CELTIC_USD}`, callback_data: 'pay:lava:celtic:USD' }]
+      [{ text: `🌍 Зарубежная карта — $${LAVA_CELTIC_USD}`, callback_data: 'pay:lava:celtic:USD' }],
+      [{ text: '⬅️ Вернуться к обычному раскладу', callback_data: 'choose:celtic:back' }]
     ]
   );
 }
@@ -1734,6 +1777,16 @@ async function handleTelegramUpdate(update) {
           throw new Error('Сначала нужен основной расклад.');
         }
         await offerCelticPaymentMethods(chatId, callback.message?.message_id);
+      } else if (callback.data === 'choose:celtic:back') {
+        if (!session?.reading) {
+          throw new Error('Сначала нужен основной расклад.');
+        }
+        await offerPaidContinuation(
+          chatId,
+          session,
+          session.pendingReadingQuestion || session.reading.question,
+          callback.message?.message_id
+        );
       } else if (callback.data === 'pay:stars:reading') {
         await createPaymentInvoice(chatId, session, 'reading', 'STARS');
       } else if (callback.data === 'pay:stars:celtic') {
@@ -1764,7 +1817,11 @@ async function handleTelegramUpdate(update) {
         await createPaymentInvoice(chatId, session, kind, 'STARS');
       }
     } catch (err) {
-      console.error('[tarot-omen] Payment button handling failed:', err);
+      console.error('[tarot-omen] Payment button handling failed:', {
+        callback: callback.data,
+        message: err?.message,
+        stack: err?.stack
+      });
       if (chatId) {
         if (/No reading is available|Сначала нужен расклад/.test(err?.message || '') || !session) {
           await telegramSendMessage(chatId, 'Эта кнопка относится к предыдущей сессии. Начни новый расклад, и я создам новую оплату.');
