@@ -1575,7 +1575,7 @@ function buildPaidContinuationText(session = null) {
     : '';
 
   return [
-    'Если захочешь продолжить эту историю сейчас, можно выбрать следующий расклад.',
+    'Если захочешь продолжить эту историю сейчас, можно приобрести новые расклады.',
     'Обычный — 3 карты: всего 5 раскладов, 3 по пакету и ещё 2 в подарок.',
     'Кельтский крест — 10 карт: более глубокое исследование твоего вопроса. 1 крест и 2 обычных расклада в подарок.',
     'Неиспользованные расклады не сгорают и остаются доступными без срока действия.',
@@ -1588,8 +1588,7 @@ function buildPaidContinuationButtons() {
   return [
     [{ text: `⭐ Обычный — ${PAID_READING_STARS} Stars`, callback_data: 'pay:stars:reading' }],
     [{ text: `💳 Обычный — ${TRIBUTE_READING_RUB} ₽`, callback_data: 'pay:tribute:reading' }],
-    [{ text: `🔮 Кельтский крест — 10 карт — ${TRIBUTE_CELTIC_RUB} ₽`, callback_data: 'choose:celtic:payment' }],
-    [{ text: '🆕 Начать новый расклад', callback_data: 'new:topic' }]
+    [{ text: `🔮 Кельтский крест — 10 карт — ${TRIBUTE_CELTIC_RUB} ₽`, callback_data: 'choose:celtic:payment' }]
   ];
 }
 
@@ -1612,6 +1611,15 @@ async function offerPaidContinuation(chatId, session, readingQuestion = '', mess
   } else {
     await telegramSendMessageWithRetry(chatId, text);
   }
+
+  // Кнопка новой темы находится между пояснением и оплатой и не входит
+  // в клавиатуру способов оплаты. Поэтому она не исчезает при выборе
+  // способа оплаты и не вмешивается в навигацию платежа.
+  await telegramSendInlineKeyboardWithRetry(
+    chatId,
+    '',
+    [[{ text: '🆕 Начать новый расклад', callback_data: 'new:topic' }]]
+  );
 
   await telegramSendInlineKeyboardWithRetry(
     chatId,
