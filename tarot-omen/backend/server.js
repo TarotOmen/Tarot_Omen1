@@ -1021,7 +1021,7 @@ async function telegramSendCardText(chatId, text, cards) {
   }
 }
 
-async function telegramSendMessage(chatId, text, returnMessageIds = false) {
+async function telegramSendMessage(chatId, text, returnMessageIds = false, parseMode = null) {
   const messageIds = [];
 
   for (const part of splitForTelegram(text)) {
@@ -1030,7 +1030,8 @@ async function telegramSendMessage(chatId, text, returnMessageIds = false) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         chat_id: chatId,
-        text: part
+        text: part,
+        ...(parseMode ? { parse_mode: parseMode } : {})
       })
     });
 
@@ -1049,11 +1050,11 @@ async function telegramSendMessage(chatId, text, returnMessageIds = false) {
   return returnMessageIds ? messageIds : undefined;
 }
 
-async function telegramSendMessageWithRetry(chatId, text, attempts = 3) {
+async function telegramSendMessageWithRetry(chatId, text, attempts = 3, parseMode = null) {
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await telegramSendMessage(chatId, text);
+      return await telegramSendMessage(chatId, text, false, parseMode);
     } catch (err) {
       lastError = err;
       if (attempt < attempts) await sleep(attempt * 700);
@@ -1069,7 +1070,8 @@ async function telegramSendInlineKeyboard(chatId, text, buttons) {
     body: JSON.stringify({
       chat_id: chatId,
       text,
-      reply_markup: { inline_keyboard: buttons }
+      reply_markup: { inline_keyboard: buttons },
+      ...(parseMode ? { parse_mode: parseMode } : {})
     })
   });
 
@@ -1119,7 +1121,7 @@ async function telegramEditInlineKeyboardWithRetry(chatId, messageId, buttons, a
   throw lastError || new Error('Telegram keyboard edit failed.');
 }
 
-async function telegramEditMessageText(chatId, messageId, text, buttons = []) {
+async function telegramEditMessageText(chatId, messageId, text, buttons = [], parseMode = null) {
   const response = await fetch(`${TELEGRAM_API}/editMessageText`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1135,11 +1137,11 @@ async function telegramEditMessageText(chatId, messageId, text, buttons = []) {
   }
 }
 
-async function telegramEditMessageTextWithRetry(chatId, messageId, text, buttons = [], attempts = 3) {
+async function telegramEditMessageTextWithRetry(chatId, messageId, text, buttons = [], attempts = 3, parseMode = null) {
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await telegramEditMessageText(chatId, messageId, text, buttons);
+      return await telegramEditMessageText(chatId, messageId, text, buttons, parseMode);
     } catch (err) {
       lastError = err;
       if (attempt < attempts) await sleep(attempt * 700);
@@ -1568,20 +1570,17 @@ async function telegramSendPaymentUrl(chatId, text, url) {
 }
 
 function buildPaidContinuationText(session = null) {
-  const ordinary = Number(session?.paidReadingsRemaining || 0);
-  const celtic = Number(session?.paidCelticRemaining || 0);
-  const waitText = !hasPaidEntitlements(session)
-    ? 'Если не спешишь, через 72 часа после последнего использованного расклада снова будет доступен бесплатный расклад с продолжением этой истории.'
-    : '';
-
   return [
-    'Если захочешь продолжить эту историю сейчас, можно приобрести новые расклады.',
-    'Обычный — 3 карты: всего 5 раскладов, 3 по пакету и ещё 2 в подарок.',
-    'Кельтский крест — 10 карт: более глубокое исследование твоего вопроса. 1 крест и 2 обычных расклада в подарок.',
-    'Неиспользованные расклады не сгорают и остаются доступными без срока действия.',
-    ordinary || celtic ? `Сейчас доступно: обычных — ${ordinary}, Кельтских крестов — ${celtic}.` : '',
-    waitText
-  ].filter(Boolean).join('\n');
+    'Если захочешь продолжить эту историю сейчас, можно приобрести новые расклады:',
+    '',
+    '⭐️Обычный «3 карты»: 3 расклада + 2 в подарок; всего 5 раскладов',
+    '',
+    '🔮Расклад «Кельтский крест» из 10 карт: более глубокое исследование твоего вопроса. 1 «Кельтский крест» и + 2 обычных расклада «3 карты» в подарок.',
+    '',
+    '*Неиспользованные расклады не сгорают и остаются доступными без срока действия.',
+    '',
+    'Если не спешишь, через 72 часа снова будет доступен бесплатный расклад с продолжением этой истории, или сможешь задать новый вопрос.'
+  ].join('\n');
 }
 
 function buildPaidContinuationButtons() {
@@ -1606,14 +1605,12 @@ async function offerPaidContinuation(chatId, session, readingQuestion = '', mess
   // The explanatory purchase message stays in the chat. The new-topic button
   // is a separate persistent message above the payment choices.
   if (messageId) {
-    await telegramEditMessageTextWithRetry(chatId, messageId, text, []);
+    await telegramEditMessageTextWithRetry(chatId, messageId, text, [], 3, 'Markdown');
   } else {
-    await telegramSendMessageWithRetry(chatId, text);
-    // Telegram does not accept an empty message text. Use an invisible Unicode
-    // separator so the new-topic button can remain visually standalone.
+    await telegramSendMessageWithRetry(chatId, text, 3, 'Markdown');
     await telegramSendInlineKeyboardWithRetry(
       chatId,
-      '\u2063',
+      '',
       [[{ text: '🆕 Начать новый расклад', callback_data: 'new:topic' }]]
     );
   }
