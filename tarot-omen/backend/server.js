@@ -1410,27 +1410,39 @@ async function telegramSendPaymentUrl(chatId, text, url) {
       chat_id: chatId,
       text,
       reply_markup: {
-        inline_keyboard: [[{ text: '💳 Перейти к оплате', url }]]
+        inline_keyboard: [
+          [{ text: '💳 Перейти к оплате', url }],
+          [{ text: '⬅️ Назад к выбору оплаты', callback_data: 'payment:back' }]
+        ]
       }
     })
   });
-  if (!response.ok) {
-    throw new Error(`Telegram payment URL message failed: ${await response.text()}`);
+
+  const raw = await response.text();
+  let data = null;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error(`Telegram payment URL message returned invalid JSON (HTTP ${response.status}).`);
   }
+  if (!response.ok || !data?.ok) {
+    throw new Error(data?.description || `Telegram payment URL message failed (HTTP ${response.status}).`);
+  }
+  return data.result;
 }
 
 function buildPaidContinuationText(session = null) {
   const ordinary = Number(session?.paidReadingsRemaining || 0);
   const celtic = Number(session?.paidCelticRemaining || 0);
   const waitText = !hasPaidEntitlements(session)
-    ? 'Если не торопишься, можно подождать 72 часа после последнего использованного расклада. Тогда снова появится возможность сделать бесплатный расклад с продолжением этой истории.'
+    ? 'Если сейчас не хочется спешить, можно просто подождать 72 часа после последнего использованного расклада. Тогда снова появится возможность сделать бесплатный расклад и спокойно продолжить эту историю. А если захочется посмотреть совсем другую тему, для неё можно начать отдельный расклад.'
     : '';
 
   return [
-    'Если хочешь продолжить эту историю сейчас, можно выбрать новый пакет.',
-    'Обычный расклад — 3 карты: 3 расклада по пакету + 2 в подарок, итого 5 обычных раскладов.',
-    'Кельтский крест — 10 карт: 1 Кельтский крест + 2 обычных расклада в подарок.',
-    'Все неиспользованные расклады остаются за тобой без срока действия и не сгорают.',
+    'Если захочешь продолжить, здесь можно спокойно выбрать следующий расклад. Никуда торопиться не нужно.',
+    'Обычный расклад — 3 карты: всего 5 раскладов — 3 по пакету и ещё 2 в подарок.',
+    'Кельтский крест — 10 карт: 1 Кельтский крест и 2 обычных расклада в подарок.',
+    'Неиспользованные расклады остаются за тобой без срока действия и не сгорают.',
     ordinary || celtic ? `Сейчас доступно: обычных — ${ordinary}, Кельтских крестов — ${celtic}.` : '',
     waitText
   ].filter(Boolean).join('\n');
@@ -1455,12 +1467,20 @@ async function offerPaidContinuation(chatId, session, readingQuestion = '', mess
   const text = buildPaidContinuationText(session);
   const buttons = buildPaidContinuationButtons();
 
+  // The explanatory purchase message stays in the chat. Payment-method
+  // navigation lives in a separate message so choosing a method never removes
+  // the calm explanation above it.
   if (messageId) {
-    await telegramEditMessageTextWithRetry(chatId, messageId, text, buttons);
-    return;
+    await telegramEditMessageTextWithRetry(chatId, messageId, text, []);
+  } else {
+    await telegramSendMessageWithRetry(chatId, text);
   }
 
-  await telegramSendInlineKeyboardWithRetry(chatId, text, buttons);
+  await telegramSendInlineKeyboardWithRetry(
+    chatId,
+    'Выбери расклад и способ оплаты:',
+    buttons
+  );
 }
 
 async function offerCelticPaymentMethods(chatId, messageId) {
@@ -1471,9 +1491,19 @@ async function offerCelticPaymentMethods(chatId, messageId) {
     [
       [{ text: `⭐ Telegram Stars — ${CELTIC_CROSS_STARS}`, callback_data: 'pay:stars:celtic' }],
       [{ text: `💳 Карта / СБП — ${TRIBUTE_CELTIC_RUB} ₽`, callback_data: 'pay:tribute:celtic' }],
-      [{ text: '⬅️ Вернуться к обычному раскладу', callback_data: 'choose:celtic:back' }]
+      [{ text: '⬅️ Вернуться к выбору расклада', callback_data: 'choose:celtic:back' }]
     ]
   );
+}
+
+async function offerPaymentMethods(chatId, messageId) {
+  const buttons = buildPaidContinuationButtons();
+  const text = 'Выбери расклад и способ оплаты:';
+  if (messageId) {
+    await telegramEditMessageTextWithRetry(chatId, messageId, text, buttons);
+  } else {
+    await telegramSendInlineKeyboardWithRetry(chatId, text, buttons);
+  }
 }
 
 async function offerAvailablePaidReadings(chatId, session) {
@@ -1588,7 +1618,13 @@ async function telegramSendInvoice(chatId, { title, description, stars, payload 
       description,
       payload,
       currency: 'XTR',
-      prices: [{ label: title, amount }]
+      prices: [{ label: title, amount }],
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '⭐ Оплатить', pay: true }],
+          [{ text: '⬅️ Назад к выбору оплаты', callback_data: 'payment:back' }]
+        ]
+      }
     })
   });
 
@@ -1668,7 +1704,7 @@ async function createPaymentInvoice(chatId, session, kind, currency = 'STARS', p
     };
     session.pendingTributePayment = null;
 
-    await telegramSendInvoice(chatId, {
+    const invoiceMessage = await telegramSendInvoice(chatId, {
       title: isCeltic ? 'Кельтский крест' : 'Продолжение расклада',
       description: isCeltic
         ? 'Кельтский крест: 10 карт, глубокая интерпретация и продолжение истории.'
@@ -1676,6 +1712,7 @@ async function createPaymentInvoice(chatId, session, kind, currency = 'STARS', p
       stars: session.pendingPayment.stars,
       payload
     });
+    session.pendingPayment.messageId = invoiceMessage?.message_id || null;
     return;
   }
 
@@ -1691,13 +1728,14 @@ async function createPaymentInvoice(chatId, session, kind, currency = 'STARS', p
     expiresAt: Date.now() + 60 * 60 * 1000
   };
 
-  await telegramSendPaymentUrl(
+  const paymentMessage = await telegramSendPaymentUrl(
     chatId,
     isCeltic
       ? 'Открыл оплату Кельтского креста картой или через СБП. После успешной оплаты Omen автоматически продолжит историю.'
       : 'Открыл оплату банковской картой или через СБП. После успешной оплаты Omen автоматически продолжит историю.',
     tribute.paymentUrl
   );
+  session.pendingTributePayment.messageId = paymentMessage?.message_id || null;
 }
 
 function hasPaidEntitlements(session) {
@@ -1972,12 +2010,7 @@ async function handleTelegramUpdate(update) {
         if (!session?.reading) {
           throw new Error('Сначала нужен основной расклад.');
         }
-        await offerPaidContinuation(
-          chatId,
-          session,
-          session.pendingReadingQuestion || session.reading.question,
-          callback.message?.message_id
-        );
+        await offerPaymentMethods(chatId, callback.message?.message_id);
       } else if (callback.data === 'pay:stars:reading') {
         await createPaymentInvoice(chatId, session, 'reading', 'STARS');
         await deleteCallbackMessage(callback);
@@ -1990,6 +2023,16 @@ async function handleTelegramUpdate(update) {
       } else if (callback.data === 'pay:tribute:celtic') {
         await createPaymentInvoice(chatId, session, 'celtic', 'RUB');
         await deleteCallbackMessage(callback);
+      } else if (callback.data === 'payment:back') {
+        if (!session) throw new Error('Сначала нужен расклад.');
+        if (session.pendingPayment?.messageId === callback.message?.message_id) {
+          session.pendingPayment = null;
+        }
+        if (session.pendingTributePayment?.messageId === callback.message?.message_id) {
+          session.pendingTributePayment = null;
+        }
+        await deleteCallbackMessage(callback);
+        await offerPaymentMethods(chatId, null);
       } else if (callback.data === 'use:paid:reading') {
         if (session?.pendingGiftReading && session?.paidReadingsRemaining > 0) {
           session.pendingGiftReading = false;
