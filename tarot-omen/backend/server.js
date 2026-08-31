@@ -85,6 +85,7 @@ For every spread:
 - Length: about 4 short paragraphs for three cards; about 7 short paragraphs for the Celtic Cross.
 - For the Celtic Cross, explicitly connect the interpretation to the meaning of each position and name the position when it helps clarity. Do not treat the 10 cards as a generic list of meanings.
 - Keep the interpretation flowing and personal rather than turning it into a dry catalogue.
+- Whenever you mention a card by name, use its exact card name as provided in the spread data, without changing its wording or case.
 
 Return ONLY valid JSON with exactly one string field:
 {"interpretation":"..."}`;
@@ -883,6 +884,69 @@ function splitForTelegram(text, maxLen = TELEGRAM_CHUNK_SIZE) {
   }
 
   return chunks;
+}
+
+function escapeTelegramHtml(text) {
+  return String(text ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function formatCardNamesHtml(text, cards = []) {
+  let formatted = escapeTelegramHtml(text);
+  const names = [...new Set((Array.isArray(cards) ? cards : [])
+    .map((card) => String(card?.name || '').trim())
+    .filter(Boolean))]
+    .sort((a, b) => b.length - a.length);
+
+  for (const name of names) {
+    const escapedName = escapeTelegramHtml(name);
+    if (!escapedName) continue;
+    const escapedPattern = escapedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    formatted = formatted.replace(new RegExp(`(?<!<b>)${escapedPattern}(?!</b>)`, 'gi'), `<b>${escapedName}</b>`);
+  }
+
+  return formatted;
+}
+
+async function telegramSendCardText(chatId, text, cards) {
+  const formatted = formatCardNamesHtml(text, cards);
+  const chunks = splitForTelegram(formatted);
+  // Splitting formatted HTML can cut a tag in half, so send shorter raw chunks
+  // with formatting applied independently whenever a split is required.
+  if (chunks.length <= 1) {
+    const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: formatted,
+        parse_mode: 'HTML'
+      })
+    });
+    if (!response.ok) {
+      throw new Error(`Telegram sendMessage (card formatting) failed: ${await response.text()}`);
+    }
+    return;
+  }
+
+  // For long interpretations, split the original text first, then format each
+  // chunk. This prevents malformed HTML when Telegram's message limit is hit.
+  for (const part of splitForTelegram(String(text ?? ''))) {
+    const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: formatCardNamesHtml(part, cards),
+        parse_mode: 'HTML'
+      })
+    });
+    if (!response.ok) {
+      throw new Error(`Telegram sendMessage (card formatting) failed: ${await response.text()}`);
+    }
+  }
 }
 
 async function telegramSendMessage(chatId, text, returnMessageIds = false) {
@@ -1861,11 +1925,11 @@ async function runPaidCelticReading(chatId, session, question, options = {}) {
     for (const messageId of mixingMessageIds || []) await telegramDeleteMessage(chatId, messageId);
     await telegramDeleteMessage(chatId, shuffleMessageId);
 
-    await telegramSendMessage(chatId, formatCelticCardMap(cards));
+    await telegramSendCardText(chatId, formatCelticCardMap(cards), cards);
     await sleep(1500);
 
     const result = await interpretationPromise;
-    await telegramSendMessage(chatId, result.interpretation);
+    await telegramSendCardText(chatId, result.interpretation, cards);
 
     let followup = '';
     try {
@@ -1875,7 +1939,7 @@ async function runPaidCelticReading(chatId, session, question, options = {}) {
         cards,
         interpretation: result.interpretation
       });
-      await telegramSendMessage(chatId, followup);
+      await telegramSendCardText(chatId, followup, cards);
     } catch (followupErr) {
       console.error('[tarot-omen] Celtic follow-up question generation failed:', followupErr);
     }
@@ -1928,7 +1992,7 @@ async function runPaidThreeCardReading(chatId, session, question) {
 
     const result = await interpretationPromise;
 
-    await telegramSendMessage(chatId, result.interpretation);
+    await telegramSendCardText(chatId, result.interpretation, cards);
 
     let followup = '';
     try {
@@ -1938,7 +2002,7 @@ async function runPaidThreeCardReading(chatId, session, question) {
         cards,
         interpretation: result.interpretation
       });
-      await telegramSendMessage(chatId, followup);
+      await telegramSendCardText(chatId, followup, cards);
     } catch (followupErr) {
       console.error('[tarot-omen] Paid follow-up question generation failed:', followupErr);
     }
@@ -2230,7 +2294,7 @@ async function handleTelegramUpdate(update) {
 
       // The 72-hour free continuation stays text-only. Voice is reserved for
       // the first free reading and paid readings.
-      await telegramSendMessage(chatId, result.interpretation);
+      await telegramSendCardText(chatId, result.interpretation, cards);
 
       try {
         const followup = await generateFollowupQuestion({
@@ -2239,7 +2303,7 @@ async function handleTelegramUpdate(update) {
           cards,
           interpretation: result.interpretation
         });
-        await telegramSendMessage(chatId, followup);
+        await telegramSendCardText(chatId, followup, cards);
       } catch (followupErr) {
         console.error('[tarot-omen] 72h follow-up question generation failed:', followupErr);
       }
@@ -2319,7 +2383,7 @@ async function handleTelegramUpdate(update) {
     session.history = session.history.slice(-24);
 
     try {
-      await telegramSendMessageWithRetry(chatId, result.reply);
+      await telegramSendCardText(chatId, result.reply, session.reading.cards);
     } catch (sendErr) {
       console.error('[tarot-omen] Telegram paid conversation reply delivery failed:', sendErr);
       return;
@@ -2348,7 +2412,7 @@ async function handleTelegramUpdate(update) {
       }
     } else {
       try {
-        await telegramSendMessageWithRetry(chatId, result.nextMessage);
+        await telegramSendCardText(chatId, result.nextMessage, session.reading.cards);
       } catch (sendErr) {
         console.error('[tarot-omen] Telegram paid next-message delivery failed:', sendErr);
       }
@@ -2391,7 +2455,7 @@ async function handleTelegramUpdate(update) {
     // A Telegram delivery failure must never be reported as a Gemini failure after
     // the reply has already reached the user. Retry each message independently.
     try {
-      await telegramSendMessageWithRetry(chatId, result.reply);
+      await telegramSendCardText(chatId, result.reply, session.reading.cards);
     } catch (sendErr) {
       console.error('[tarot-omen] Telegram conversation reply delivery failed:', sendErr);
       return;
@@ -2411,7 +2475,7 @@ async function handleTelegramUpdate(update) {
       }
     } else {
       try {
-        await telegramSendMessageWithRetry(chatId, result.nextMessage);
+        await telegramSendCardText(chatId, result.nextMessage, session.reading.cards);
       } catch (sendErr) {
         console.error('[tarot-omen] Telegram next-message delivery failed:', sendErr);
         // Do not send a misleading "Не смог сейчас продолжить мысль" after a successful reply.
@@ -2440,7 +2504,7 @@ async function handleTelegramUpdate(update) {
 
     const result = await interpretationPromise;
 
-    await telegramSendMessage(chatId, result.interpretation);
+    await telegramSendCardText(chatId, result.interpretation, cards);
 
     // Every completed spread gets a separate, context-aware question that invites
     // the user to continue the conversation. It is text-only and never goes to ElevenLabs.
@@ -2451,7 +2515,7 @@ async function handleTelegramUpdate(update) {
         cards,
         interpretation: result.interpretation
       });
-      await telegramSendMessage(chatId, followup);
+      await telegramSendCardText(chatId, followup, cards);
     } catch (followupErr) {
       console.error('[tarot-omen] Follow-up question generation failed:', followupErr);
     }
