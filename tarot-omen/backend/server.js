@@ -1588,7 +1588,6 @@ function buildPaidContinuationButtons() {
   return [
     [{ text: `⭐ Обычный — ${PAID_READING_STARS} Stars`, callback_data: 'pay:stars:reading' }],
     [{ text: `💳 Обычный — ${TRIBUTE_READING_RUB} ₽`, callback_data: 'pay:tribute:reading' }],
-    [{ text: '🆕 Начать новый расклад', callback_data: 'new:topic' }],
     [{ text: `🔮 Кельтский крест — 10 карт — ${TRIBUTE_CELTIC_RUB} ₽`, callback_data: 'choose:celtic:payment' }]
   ];
 }
@@ -1604,13 +1603,17 @@ async function offerPaidContinuation(chatId, session, readingQuestion = '', mess
   const text = buildPaidContinuationText(session);
   const buttons = buildPaidContinuationButtons();
 
-  // The explanatory purchase message stays in the chat. Payment-method
-  // navigation lives in a separate message so choosing a method never removes
-  // the calm explanation above it.
+  // The explanatory purchase message stays in the chat. The new-topic button
+  // is a separate persistent message above the payment choices.
   if (messageId) {
     await telegramEditMessageTextWithRetry(chatId, messageId, text, []);
   } else {
     await telegramSendMessageWithRetry(chatId, text);
+    await telegramSendInlineKeyboardWithRetry(
+      chatId,
+      '',
+      [[{ text: '🆕 Начать новый расклад', callback_data: 'new:topic' }]]
+    );
   }
 
   await telegramSendInlineKeyboardWithRetry(
