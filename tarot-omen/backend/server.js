@@ -1612,12 +1612,9 @@ async function offerPaidContinuation(chatId, session, readingQuestion = '', mess
     await telegramSendMessageWithRetry(chatId, text);
   }
 
-  // Кнопка новой темы находится между пояснением и оплатой и не входит
-  // в клавиатуру способов оплаты. Поэтому она не исчезает при выборе
-  // способа оплаты и не вмешивается в навигацию платежа.
   await telegramSendInlineKeyboardWithRetry(
     chatId,
-    '',
+    ' ',
     [[{ text: '🆕 Начать новый расклад', callback_data: 'new:topic' }]]
   );
 
