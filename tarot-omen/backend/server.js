@@ -1609,9 +1609,11 @@ async function offerPaidContinuation(chatId, session, readingQuestion = '', mess
     await telegramEditMessageTextWithRetry(chatId, messageId, text, []);
   } else {
     await telegramSendMessageWithRetry(chatId, text);
+    // Telegram does not accept an empty message text. Use an invisible Unicode
+    // separator so the new-topic button can remain visually standalone.
     await telegramSendInlineKeyboardWithRetry(
       chatId,
-      '',
+      '\u2063',
       [[{ text: '🆕 Начать новый расклад', callback_data: 'new:topic' }]]
     );
   }
