@@ -1049,11 +1049,11 @@ async function telegramSendMessage(chatId, text, returnMessageIds = false) {
   return returnMessageIds ? messageIds : undefined;
 }
 
-async function telegramSendMessageWithRetry(chatId, text, attempts = 3) {
+async function telegramSendMessageWithRetry(chatId, text, attempts = 3, returnMessageIds = false) {
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await telegramSendMessage(chatId, text);
+      return await telegramSendMessage(chatId, text, returnMessageIds);
     } catch (err) {
       lastError = err;
       if (attempt < attempts) await sleep(attempt * 700);
@@ -1726,8 +1726,8 @@ async function showNewTopicInfo(chatId, session, text) {
     }
   }
 
-  const sent = await telegramSendMessageWithRetry(chatId, text);
-  session.newTopicInfoMessageId = Number(sent?.message_id || 0);
+  const messageIds = await telegramSendMessageWithRetry(chatId, text, 3, true);
+  session.newTopicInfoMessageId = Number(messageIds?.[0] || 0);
 }
 
 async function handleNewTopicRequest(chatId, session) {
