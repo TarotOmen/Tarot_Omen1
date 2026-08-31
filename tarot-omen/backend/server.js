@@ -1021,7 +1021,7 @@ async function telegramSendCardText(chatId, text, cards) {
   }
 }
 
-async function telegramSendMessage(chatId, text, returnMessageIds = false, parseMode = null) {
+async function telegramSendMessage(chatId, text, returnMessageIds = false) {
   const messageIds = [];
 
   for (const part of splitForTelegram(text)) {
@@ -1030,8 +1030,7 @@ async function telegramSendMessage(chatId, text, returnMessageIds = false, parse
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         chat_id: chatId,
-        text: part,
-        ...(parseMode ? { parse_mode: parseMode } : {})
+        text: part
       })
     });
 
@@ -1050,11 +1049,11 @@ async function telegramSendMessage(chatId, text, returnMessageIds = false, parse
   return returnMessageIds ? messageIds : undefined;
 }
 
-async function telegramSendMessageWithRetry(chatId, text, attempts = 3, parseMode = null) {
+async function telegramSendMessageWithRetry(chatId, text, attempts = 3) {
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await telegramSendMessage(chatId, text, false, parseMode);
+      return await telegramSendMessage(chatId, text);
     } catch (err) {
       lastError = err;
       if (attempt < attempts) await sleep(attempt * 700);
@@ -1070,8 +1069,7 @@ async function telegramSendInlineKeyboard(chatId, text, buttons) {
     body: JSON.stringify({
       chat_id: chatId,
       text,
-      reply_markup: { inline_keyboard: buttons },
-      ...(parseMode ? { parse_mode: parseMode } : {})
+      reply_markup: { inline_keyboard: buttons }
     })
   });
 
@@ -1121,7 +1119,7 @@ async function telegramEditInlineKeyboardWithRetry(chatId, messageId, buttons, a
   throw lastError || new Error('Telegram keyboard edit failed.');
 }
 
-async function telegramEditMessageText(chatId, messageId, text, buttons = [], parseMode = null) {
+async function telegramEditMessageText(chatId, messageId, text, buttons = []) {
   const response = await fetch(`${TELEGRAM_API}/editMessageText`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1137,11 +1135,11 @@ async function telegramEditMessageText(chatId, messageId, text, buttons = [], pa
   }
 }
 
-async function telegramEditMessageTextWithRetry(chatId, messageId, text, buttons = [], attempts = 3, parseMode = null) {
+async function telegramEditMessageTextWithRetry(chatId, messageId, text, buttons = [], attempts = 3) {
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await telegramEditMessageText(chatId, messageId, text, buttons, parseMode);
+      return await telegramEditMessageText(chatId, messageId, text, buttons);
     } catch (err) {
       lastError = err;
       if (attempt < attempts) await sleep(attempt * 700);
@@ -1569,7 +1567,7 @@ async function telegramSendPaymentUrl(chatId, text, url) {
   return data.result;
 }
 
-function buildPaidContinuationText(session = null) {
+function buildPaidContinuationText() {
   return [
     'Если захочешь продолжить эту историю сейчас, можно приобрести новые расклады:',
     '',
@@ -1599,18 +1597,18 @@ async function offerPaidContinuation(chatId, session, readingQuestion = '', mess
   session.readingOfferShown = true;
   session.pendingGiftReading = false;
 
-  const text = buildPaidContinuationText(session);
+  const text = buildPaidContinuationText();
   const buttons = buildPaidContinuationButtons();
 
-  // The explanatory purchase message stays in the chat. The new-topic button
-  // is a separate persistent message above the payment choices.
   if (messageId) {
-    await telegramEditMessageTextWithRetry(chatId, messageId, text, [], 3, 'Markdown');
+    await telegramEditMessageTextWithRetry(chatId, messageId, text, []);
   } else {
-    await telegramSendMessageWithRetry(chatId, text, 3, 'Markdown');
+    await telegramSendMessageWithRetry(chatId, text);
+    // Telegram rejects an empty message. Use an invisible separator so the
+    // standalone new-topic button can remain between the offer and payment menu.
     await telegramSendInlineKeyboardWithRetry(
       chatId,
-      '',
+      '\u2063',
       [[{ text: '🆕 Начать новый расклад', callback_data: 'new:topic' }]]
     );
   }
