@@ -1355,6 +1355,8 @@ async function handleTributeWebhook(body) {
       paidPackageKind: 'reading',
       pendingGiftReading: false,
       pendingPaidReadingKind: '',
+      pendingNewTopic: false,
+      pendingNewTopicKind: '',
       paidContinuation: false,
       readingOfferShown: false,
       pendingReadingQuestion: '',
@@ -1417,8 +1419,21 @@ async function telegramSendPaymentUrl(chatId, text, url) {
   }
 }
 
-function buildPaidContinuationText() {
-  return 'Если хочешь продолжить эту историю сейчас, можно купить новый пакет. Обычный расклад — 3 карты: после оплаты ты получишь 5 обычных раскладов, из них 2 — в подарок. Кельтский крест — 10 карт: после оплаты получишь 1 Кельтский крест и 2 обычных расклада в подарок. Неиспользованные расклады не сгорают.';
+function buildPaidContinuationText(session = null) {
+  const ordinary = Number(session?.paidReadingsRemaining || 0);
+  const celtic = Number(session?.paidCelticRemaining || 0);
+  const waitText = !hasPaidEntitlements(session)
+    ? 'Если не торопишься, можно подождать 72 часа после последнего использованного расклада. Тогда снова появится возможность сделать бесплатный расклад с продолжением этой истории.'
+    : '';
+
+  return [
+    'Если хочешь продолжить эту историю сейчас, можно выбрать новый пакет.',
+    'Обычный расклад — 3 карты: 3 расклада по пакету + 2 в подарок, итого 5 обычных раскладов.',
+    'Кельтский крест — 10 карт: 1 Кельтский крест + 2 обычных расклада в подарок.',
+    'Все неиспользованные расклады остаются за тобой без срока действия и не сгорают.',
+    ordinary || celtic ? `Сейчас доступно: обычных — ${ordinary}, Кельтских крестов — ${celtic}.` : '',
+    waitText
+  ].filter(Boolean).join('\n');
 }
 
 function buildPaidContinuationButtons() {
@@ -1437,7 +1452,7 @@ async function offerPaidContinuation(chatId, session, readingQuestion = '', mess
   session.readingOfferShown = true;
   session.pendingGiftReading = false;
 
-  const text = buildPaidContinuationText();
+  const text = buildPaidContinuationText(session);
   const buttons = buildPaidContinuationButtons();
 
   if (messageId) {
@@ -1478,6 +1493,13 @@ async function offerAvailablePaidReadings(chatId, session) {
     }]);
   }
 
+  if (buttons.length) {
+    buttons.push([{
+      text: '🆕 Расклад на новую тему',
+      callback_data: 'new:topic'
+    }]);
+  }
+
   if (!buttons.length) {
     session.pendingGiftReading = false;
     session.pendingPaidReadingKind = '';
@@ -1498,6 +1520,52 @@ async function offerAvailablePaidReadings(chatId, session) {
     chatId,
     `У тебя остались оплаченные расклады. Они не сгорают и будут доступны, пока ты их не используешь.\n${ordinaryText}\n${celticText}`.trim(),
     buttons
+  );
+}
+
+async function deleteCallbackMessage(callback) {
+  const chatId = callback?.message?.chat?.id;
+  const messageId = callback?.message?.message_id;
+  if (chatId && messageId) {
+    await telegramDeleteMessage(chatId, messageId);
+  }
+}
+
+function clearReadingStoryForNewTopic(session) {
+  session.reading = null;
+  session.history = [];
+  session.pendingReadingQuestion = '';
+  session.readingOfferShown = false;
+  session.pendingGiftReading = false;
+  session.pendingPaidReadingKind = '';
+  session.paidConversationUsed = 0;
+}
+
+async function handleNewTopicRequest(chatId, session) {
+  if (!session) return;
+
+  const preferredKind = Number(session.paidReadingsRemaining || 0) > 0
+    ? 'reading'
+    : Number(session.paidCelticRemaining || 0) > 0
+      ? 'celtic'
+      : '';
+
+  if (!preferredKind) {
+    await telegramSendMessage(chatId, 'Сейчас нет доступного оплаченного расклада для новой темы.');
+    return;
+  }
+
+  session.pendingNewTopic = true;
+  session.pendingNewTopicKind = preferredKind;
+  session.readingOfferShown = false;
+  session.pendingReadingQuestion = '';
+  session.pendingGiftReading = false;
+
+  await telegramSendMessage(
+    chatId,
+    preferredKind === 'celtic'
+      ? 'Хорошо. Напиши новый вопрос, и Кельтский крест будет сделан уже на эту тему, отдельно от предыдущей истории.'
+      : 'Хорошо. Напиши новый вопрос, и следующий расклад будет сделан уже на эту тему, отдельно от предыдущей истории.'
   );
 }
 
@@ -1702,7 +1770,7 @@ async function handleSuccessfulPayment(message) {
     return true;
   }
 
-  await telegramSendMessage(chatId, 'Оплата прошла. В пакет входят два расклада: один сейчас и ещё один — в подарок. Начинаем первый.');
+  await telegramSendMessage(chatId, 'Оплата прошла. У тебя 5 обычных раскладов: 3 входят в пакет и ещё 2 — в подарок. Начинаем первый.');
   await runPaidThreeCardReading(chatId, session, pending.readingQuestion || session.reading.question);
   return true;
 }
@@ -1912,17 +1980,22 @@ async function handleTelegramUpdate(update) {
         );
       } else if (callback.data === 'pay:stars:reading') {
         await createPaymentInvoice(chatId, session, 'reading', 'STARS');
+        await deleteCallbackMessage(callback);
       } else if (callback.data === 'pay:stars:celtic') {
         await createPaymentInvoice(chatId, session, 'celtic', 'STARS');
+        await deleteCallbackMessage(callback);
       } else if (callback.data === 'pay:tribute:reading') {
         await createPaymentInvoice(chatId, session, 'reading', 'RUB');
+        await deleteCallbackMessage(callback);
       } else if (callback.data === 'pay:tribute:celtic') {
         await createPaymentInvoice(chatId, session, 'celtic', 'RUB');
+        await deleteCallbackMessage(callback);
       } else if (callback.data === 'use:paid:reading') {
         if (session?.pendingGiftReading && session?.paidReadingsRemaining > 0) {
           session.pendingGiftReading = false;
           session.pendingPaidReadingKind = '';
           session.pendingReadingQuestion = '';
+          await deleteCallbackMessage(callback);
           await telegramSendMessage(chatId, `Используем обычный расклад. Осталось после этого: ${Math.max(0, Number(session.paidReadingsRemaining || 0) - 1)}.`);
           await runPaidThreeCardReading(chatId, session, session.reading?.question || 'Посмотреть следующий слой этой истории');
         }
@@ -1931,12 +2004,17 @@ async function handleTelegramUpdate(update) {
           session.pendingGiftReading = false;
           session.pendingPaidReadingKind = '';
           session.pendingReadingQuestion = '';
+          await deleteCallbackMessage(callback);
           await telegramSendMessage(chatId, 'Используем Кельтский крест.');
           await runPaidCelticReading(chatId, session, session.reading?.question || 'Посмотреть следующий слой этой истории');
         }
+      } else if (callback.data === 'new:topic') {
+        await deleteCallbackMessage(callback);
+        await handleNewTopicRequest(chatId, session);
       } else if (callback.data === 'pay:reading' || callback.data === 'pay:celtic') {
         const kind = callback.data === 'pay:celtic' ? 'celtic' : 'reading';
         await createPaymentInvoice(chatId, session, kind, 'STARS');
+        await deleteCallbackMessage(callback);
       }
     } catch (err) {
       console.error('[tarot-omen] Payment button handling failed:', {
@@ -2020,6 +2098,35 @@ async function handleTelegramUpdate(update) {
   }
 
   const session = sessions.get(chatId);
+
+  // ===== NEW TOPIC MODE =====
+  // Entered only by the explicit 'new topic' button. Without it, the existing
+  // reading/history continues exactly as before.
+  if (session?.pendingNewTopic) {
+    const requestedKind = session.pendingNewTopicKind ||
+      (Number(session.paidReadingsRemaining || 0) > 0 ? 'reading' : 'celtic');
+
+    session.pendingNewTopic = false;
+    session.pendingNewTopicKind = '';
+    clearReadingStoryForNewTopic(session);
+
+    try {
+      if (requestedKind === 'celtic' && Number(session.paidCelticRemaining || 0) > 0) {
+        await runPaidCelticReading(chatId, session, text);
+        return;
+      }
+      if (Number(session.paidReadingsRemaining || 0) > 0) {
+        await runPaidThreeCardReading(chatId, session, text);
+        return;
+      }
+      await telegramSendMessage(chatId, 'Не удалось найти доступный расклад для новой темы.');
+      return;
+    } catch (err) {
+      console.error('[tarot-omen] New topic reading failed:', err);
+      await telegramSendMessage(chatId, 'Не удалось запустить расклад на новую тему. Попробуй ещё раз.');
+      return;
+    }
+  }
 
   // If Omen has already offered a specific next spread and the user confirms
   // in plain text (for example, "Хочу", "Давай", "Да"), go straight to
@@ -2323,6 +2430,8 @@ async function handleTelegramUpdate(update) {
       paidPackageKind: 'reading',
       pendingGiftReading: false,
       pendingPaidReadingKind: '',
+      pendingNewTopic: false,
+      pendingNewTopicKind: '',
       paidContinuation: PAID_CONTINUATION_DEFAULT,
       readingOfferShown: false,
       pendingReadingQuestion: '',
