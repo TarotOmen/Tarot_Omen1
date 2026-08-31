@@ -1076,6 +1076,9 @@ async function telegramSendInlineKeyboard(chatId, text, buttons) {
   if (!response.ok) {
     throw new Error(`Telegram sendMessage with keyboard failed: ${await response.text()}`);
   }
+
+  const data = await response.json();
+  return data?.result || null;
 }
 
 async function telegramSendInlineKeyboardWithRetry(chatId, text, buttons, attempts = 3) {
@@ -1493,6 +1496,7 @@ async function handleTributeWebhook(body) {
       pendingPaidReadingKind: '',
       pendingNewTopic: false,
       pendingNewTopicKind: '',
+      newTopicInfoMessageId: 0,
       paidContinuation: false,
       readingOfferShown: false,
       pendingReadingQuestion: '',
@@ -1601,14 +1605,13 @@ async function offerPaidContinuation(chatId, session, readingQuestion = '', mess
   const buttons = buildPaidContinuationButtons();
 
   if (messageId) {
-    await telegramEditMessageTextWithRetry(chatId, messageId, text, []);
+    await telegramEditMessageTextWithRetry(chatId, messageId, text, [
+      [{ text: '🆕 Начать новый расклад', callback_data: 'new:topic' }]
+    ]);
   } else {
-    await telegramSendMessageWithRetry(chatId, text);
-    // Telegram rejects an empty message. Use an invisible separator so the
-    // standalone new-topic button can remain between the offer and payment menu.
     await telegramSendInlineKeyboardWithRetry(
       chatId,
-      '\u2063',
+      text,
       [[{ text: '🆕 Начать новый расклад', callback_data: 'new:topic' }]]
     );
   }
@@ -1706,6 +1709,25 @@ function clearReadingStoryForNewTopic(session) {
   session.pendingGiftReading = false;
   session.pendingPaidReadingKind = '';
   session.paidConversationUsed = 0;
+  session.newTopicInfoMessageId = 0;
+}
+
+async function showNewTopicInfo(chatId, session, text) {
+  const existingMessageId = Number(session?.newTopicInfoMessageId || 0);
+
+  if (existingMessageId) {
+    try {
+      await telegramEditMessageTextWithRetry(chatId, existingMessageId, text, []);
+      return;
+    } catch (err) {
+      // The old message may have been deleted by Telegram or by the user.
+      // Clear the stale id and create one clean replacement.
+      session.newTopicInfoMessageId = 0;
+    }
+  }
+
+  const sent = await telegramSendMessageWithRetry(chatId, text);
+  session.newTopicInfoMessageId = Number(sent?.message_id || 0);
 }
 
 async function handleNewTopicRequest(chatId, session) {
@@ -1724,8 +1746,9 @@ async function handleNewTopicRequest(chatId, session) {
     session.pendingReadingQuestion = '';
     session.pendingGiftReading = false;
 
-    await telegramSendMessage(
+    await showNewTopicInfo(
       chatId,
+      session,
       preferredKind === 'celtic'
         ? 'Хорошо. Напиши новый вопрос, и Кельтский крест будет сделан уже на эту тему, отдельно от предыдущей истории.'
         : 'Хорошо. Напиши новый вопрос, и следующий расклад будет сделан уже на эту тему, отдельно от предыдущей истории.'
@@ -1743,15 +1766,17 @@ async function handleNewTopicRequest(chatId, session) {
     session.pendingReadingQuestion = '';
     session.pendingGiftReading = false;
 
-    await telegramSendMessage(
+    await showNewTopicInfo(
       chatId,
+      session,
       'Хорошо. Напиши новый вопрос, и бесплатный расклад будет сделан уже на новую тему, отдельно от предыдущей истории.'
     );
     return;
   }
 
-  await telegramSendMessage(
+  await showNewTopicInfo(
     chatId,
+    session,
     'Для новой темы можно приобрести новый расклад выше или, если не спешишь, подождать 72 часа после последнего использованного расклада. Тогда снова будет доступен бесплатный расклад.'
   );
 }
@@ -2685,6 +2710,7 @@ async function handleTelegramUpdate(update) {
       pendingPaidReadingKind: '',
       pendingNewTopic: false,
       pendingNewTopicKind: '',
+      newTopicInfoMessageId: 0,
       paidContinuation: PAID_CONTINUATION_DEFAULT,
       readingOfferShown: false,
       pendingReadingQuestion: '',
