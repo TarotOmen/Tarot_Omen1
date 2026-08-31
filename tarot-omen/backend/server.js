@@ -1588,6 +1588,7 @@ function buildPaidContinuationButtons() {
   return [
     [{ text: `⭐ Обычный — ${PAID_READING_STARS} Stars`, callback_data: 'pay:stars:reading' }],
     [{ text: `💳 Обычный — ${TRIBUTE_READING_RUB} ₽`, callback_data: 'pay:tribute:reading' }],
+    [{ text: '🆕 Начать новый расклад', callback_data: 'new:topic' }],
     [{ text: `🔮 Кельтский крест — 10 карт — ${TRIBUTE_CELTIC_RUB} ₽`, callback_data: 'choose:celtic:payment' }]
   ];
 }
@@ -1611,12 +1612,6 @@ async function offerPaidContinuation(chatId, session, readingQuestion = '', mess
   } else {
     await telegramSendMessageWithRetry(chatId, text);
   }
-
-  await telegramSendInlineKeyboardWithRetry(
-    chatId,
-    ' ',
-    [[{ text: '🆕 Начать новый расклад', callback_data: 'new:topic' }]]
-  );
 
   await telegramSendInlineKeyboardWithRetry(
     chatId,
@@ -1757,7 +1752,7 @@ async function handleNewTopicRequest(chatId, session) {
 
   await telegramSendMessage(
     chatId,
-    'Для новой темы можно либо выбрать новый платный расклад выше, либо, если не спешишь, подождать 72 часа после последнего использованного расклада. Тогда снова будет доступен бесплатный расклад.'
+    'Для новой темы можно приобрести новый расклад выше или, если не спешишь, подождать 72 часа после последнего использованного расклада. Тогда снова будет доступен бесплатный расклад.'
   );
 }
 
