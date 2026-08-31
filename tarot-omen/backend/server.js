@@ -2090,18 +2090,20 @@ async function runPaidCelticReading(chatId, session, question, options = {}) {
     session.history = Array.isArray(session.history) ? session.history.slice(-24) : [];
     session.paidConversationUsed = 0;
     session.paidReadingActive = true;
-    session.paidCelticRemaining = Math.max(0, Number(session.paidCelticRemaining || 0) - 1);
-    session.paidPackageKind = hasPaidEntitlements(session) ? 'mixed' : 'celtic';
+    if (!options.test) {
+      session.paidCelticRemaining = Math.max(0, Number(session.paidCelticRemaining || 0) - 1);
+      session.paidPackageKind = hasPaidEntitlements(session) ? 'mixed' : 'celtic';
+      session.lastPaidReadingAt = Date.now();
+      session.freeConversationUsed = FREE_CONVERSATION_LIMIT;
+      session.freeCooldownUsed = false;
+      session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
+      session.pendingPayment = null;
+      session.pendingTributePayment = null;
+    }
     session.readingOfferShown = false;
     session.pendingReadingQuestion = '';
     session.pendingGiftReading = false;
     session.pendingPaidReadingKind = '';
-    session.lastPaidReadingAt = Date.now();
-    session.freeConversationUsed = FREE_CONVERSATION_LIMIT;
-    session.freeCooldownUsed = false;
-    session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
-    session.pendingPayment = null;
-    session.pendingTributePayment = null;
   } catch (err) {
     console.error('[tarot-omen] Celtic reading error:', err);
     await telegramSendMessage(chatId, 'Не удалось получить Кельтский крест. Оплата сохранена за этой историей — попробуй ещё раз.');
@@ -2174,7 +2176,15 @@ async function sendStartMessage(chatId) {
   const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text: 'Задавай свой вопрос' })
+    body: JSON.stringify({
+      chat_id: chatId,
+      text: 'Задавай свой вопрос',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🧪 Тест Кельтского креста', callback_data: 'test:celtic' }]
+        ]
+      }
+    })
   });
   if (!response.ok) {
     throw new Error(`Telegram start message failed: ${await response.text()}`);
@@ -2201,7 +2211,13 @@ async function handleTelegramUpdate(update) {
     const chatId = callback.message?.chat?.id;
     const session = sessions.get(chatId);
     try {
-      if (callback.data === 'choose:celtic:payment') {
+      if (callback.data === 'test:celtic') {
+        // Temporary diagnostic entry point. It runs the real Celtic Cross pipeline
+        // without requiring payment and without consuming any paid entitlement.
+        await deleteCallbackMessage(callback);
+        await telegramSendMessage(chatId, 'Тест Кельтского креста. Запускаю расклад без оплаты.');
+        await runPaidCelticReading(chatId, session, session?.reading?.question || 'Проверка работы Кельтского креста', { test: true });
+      } else if (callback.data === 'choose:celtic:payment') {
         if (!session?.reading) {
           throw new Error('Сначала нужен основной расклад.');
         }
