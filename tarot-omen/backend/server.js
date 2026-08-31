@@ -1497,6 +1497,7 @@ async function handleTributeWebhook(body) {
       pendingNewTopic: false,
       pendingNewTopicKind: '',
       newTopicInfoMessageId: 0,
+      newTopicInfoPromise: null,
       paidContinuation: false,
       readingOfferShown: false,
       pendingReadingQuestion: '',
@@ -1713,21 +1714,38 @@ function clearReadingStoryForNewTopic(session) {
 }
 
 async function showNewTopicInfo(chatId, session, text) {
-  const existingMessageId = Number(session?.newTopicInfoMessageId || 0);
-
-  if (existingMessageId) {
-    try {
-      await telegramEditMessageTextWithRetry(chatId, existingMessageId, text, []);
-      return;
-    } catch (err) {
-      // The old message may have been deleted by Telegram or by the user.
-      // Clear the stale id and create one clean replacement.
-      session.newTopicInfoMessageId = 0;
-    }
+  // Telegram can deliver several callback queries when a user taps the same
+  // button repeatedly before the first request finishes. Without a per-session
+  // lock, every callback can see newTopicInfoMessageId === 0 and send another
+  // identical message. Serialize this operation so only one info message can
+  // exist for the current session.
+  if (session.newTopicInfoPromise) {
+    return session.newTopicInfoPromise;
   }
 
-  const messageIds = await telegramSendMessageWithRetry(chatId, text, 3, true);
-  session.newTopicInfoMessageId = Number(messageIds?.[0] || 0);
+  session.newTopicInfoPromise = (async () => {
+    const existingMessageId = Number(session?.newTopicInfoMessageId || 0);
+
+    if (existingMessageId) {
+      try {
+        await telegramEditMessageTextWithRetry(chatId, existingMessageId, text, []);
+        return;
+      } catch (err) {
+        // The old message may have been deleted by Telegram or by the user.
+        // Clear the stale id and create one clean replacement.
+        session.newTopicInfoMessageId = 0;
+      }
+    }
+
+    const messageIds = await telegramSendMessageWithRetry(chatId, text, 3, true);
+    session.newTopicInfoMessageId = Number(messageIds?.[0] || 0);
+  })();
+
+  try {
+    return await session.newTopicInfoPromise;
+  } finally {
+    session.newTopicInfoPromise = null;
+  }
 }
 
 async function handleNewTopicRequest(chatId, session) {
@@ -2711,6 +2729,7 @@ async function handleTelegramUpdate(update) {
       pendingNewTopic: false,
       pendingNewTopicKind: '',
       newTopicInfoMessageId: 0,
+      newTopicInfoPromise: null,
       paidContinuation: PAID_CONTINUATION_DEFAULT,
       readingOfferShown: false,
       pendingReadingQuestion: '',
