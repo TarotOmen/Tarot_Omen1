@@ -91,7 +91,7 @@ For every spread:
 Return ONLY valid JSON with exactly one string field:
 {"interpretation":"..."}`;
 
-async function generateInterpretationRequest(question, cards, userName = '', spreadType = 'three', conversationContext = '') {
+async function generateInterpretation(question, cards, userName = '', spreadType = 'three', conversationContext = '') {
   if (!GEMINI_API_KEY) {
     throw new Error('GEMINI_API_KEY is not configured on the server.');
   }
@@ -129,7 +129,7 @@ async function generateInterpretationRequest(question, cards, userName = '', spr
 
   let response;
   let raw;
-  for (let attempt = 1; attempt <= 5; attempt += 1) {
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 60000);
     try {
@@ -156,13 +156,13 @@ async function generateInterpretationRequest(question, cards, userName = '', spr
       if (
         response.ok ||
         ![429, 500, 502, 503, 504].includes(response.status) ||
-        attempt === 5
+        attempt === 3
       ) {
         break;
       }
       await sleep(attempt * 1500);
     } catch (err) {
-      if (attempt === 5) {
+      if (attempt === 3) {
         if (err?.name === 'AbortError') throw new Error('Gemini request timed out after 60 seconds.');
         throw err;
       }
@@ -216,30 +216,6 @@ async function generateInterpretationRequest(question, cards, userName = '', spr
   if (!interpretation) throw new Error('Gemini returned an empty interpretation.');
   return { interpretation };
 }
-
-
-// Retry the complete Gemini operation, including malformed/empty Gemini output.
-// No non-Gemini interpretation is ever substituted.
-async function generateInterpretation(question, cards, userName = '', spreadType = 'three', conversationContext = '') {
-  let lastError;
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      return await generateInterpretationRequest(
-        question,
-        cards,
-        userName,
-        spreadType,
-        conversationContext
-      );
-    } catch (err) {
-      lastError = err;
-      console.error(`[tarot-omen] Gemini complete interpretation attempt ${attempt}/3 failed:`, err);
-      if (attempt < 3) await sleep(attempt * 1800);
-    }
-  }
-  throw lastError || new Error('Gemini interpretation failed.');
-}
-
 
 async function generateFollowupQuestion({ userName, originalQuestion, cards, interpretation }) {
   const cardBlock = cards.map((c, i) =>
@@ -429,6 +405,7 @@ function drawCelticCrossCards() {
     keywords: card.keywords
   }));
 }
+
 
 // ===== LOCAL VISUAL ASSETS =====
 
@@ -983,6 +960,7 @@ async function generateConversationResponse({ userName, originalQuestion, cards,
 
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 const TELEGRAM_CHUNK_SIZE = 3500;
+const CARDS_CAPTION = 'Вот какие карты выпали и вот что я по ним вижу';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1198,6 +1176,20 @@ async function telegramSendMessageWithRetry(chatId, text, attempts = 3, returnMe
   throw lastError || new Error('Telegram message delivery failed.');
 }
 
+async function telegramSendCardTextWithRetry(chatId, text, cards, attempts = 5) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await telegramSendCardText(chatId, text, cards);
+    } catch (err) {
+      lastError = err;
+      console.error(`[tarot-omen] Gemini text delivery attempt ${attempt}/${attempts} failed:`, err?.message || err);
+      if (attempt < attempts) await sleep(attempt * 900);
+    }
+  }
+  throw lastError || new Error('Gemini interpretation delivery failed.');
+}
+
 async function telegramSendInlineKeyboard(chatId, text, buttons) {
   const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
     method: 'POST',
@@ -1376,125 +1368,39 @@ async function telegramSendSpreadImage(chatId, imageBuffer) {
   if (!response.ok) {
     throw new Error(`Telegram sendPhoto (spread) failed: ${await response.text()}`);
   }
-
-  const data = await response.json().catch(() => null);
-  if (!data?.ok || !data?.result?.message_id) {
-    throw new Error('Telegram sendPhoto (spread) returned no successful message.');
-  }
-  return data.result.message_id;
 }
 
-// A reading is not allowed to become visible as a partial result. The spread
-// image is mandatory and must be successfully built AND delivered before the
-// Gemini interpretation is sent. There is deliberately no text-only fallback.
-async function buildRequiredSpreadImage(cards, spreadType, attempts = 6) {
-  let lastError;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+async function generateSpreadImageWithRetry(builder, cards, label = 'spread') {
+  let lastError = null;
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
     try {
-      return spreadType === 'celtic'
-        ? await buildCelticCrossImage(cards)
-        : await buildReadingImage(cards);
-    } catch (err) {
-      lastError = err;
-      console.error(`[tarot-omen] Required ${spreadType} spread image build attempt ${attempt}/${attempts} failed:`, err);
-      if (attempt < attempts) await sleep(attempt * 1500);
-    }
-  }
-  throw lastError || new Error(`Required ${spreadType} spread image could not be built.`);
-}
-
-async function sendRequiredSpreadImageBuffer(chatId, imageBuffer, attempts = 6) {
-  let lastError;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    try {
-      return await telegramSendSpreadImage(chatId, imageBuffer);
-    } catch (err) {
-      lastError = err;
-      console.error(`[tarot-omen] Required spread image delivery attempt ${attempt}/${attempts} failed:`, err);
-      if (attempt < attempts) await sleep(attempt * 1200);
-    }
-  }
-  throw lastError || new Error('Required spread image could not be delivered.');
-}
-
-// Prepare the complete reading before sending anything to the user. This is
-// intentionally ordered so an image can never be sent without a ready Gemini
-// interpretation, and a Gemini interpretation can never be sent without a
-// successfully built spread image.
-async function prepareAndDeliverReading({
-  chatId,
-  question,
-  cards,
-  userName = '',
-  spreadType = 'three',
-  conversationContext = '',
-  delayMs = 1200
-}) {
-  const interpretationPromise = generateInterpretation(
-    question,
-    cards,
-    userName,
-    spreadType,
-    conversationContext
-  );
-
-  let imageBuffer;
-  try {
-    imageBuffer = await buildRequiredSpreadImage(cards, spreadType, 6);
-  } catch (imageBuildErr) {
-    // Keep the Gemini promise private and do not expose any partial reading.
-    // The caller leaves the entitlement untouched so the whole operation can
-    // be retried later.
-    try { await interpretationPromise; } catch {}
-    throw imageBuildErr;
-  }
-
-  // Both pieces must be ready before either one becomes visible.
-  const result = await interpretationPromise;
-  await sendRequiredSpreadImageBuffer(chatId, imageBuffer, 6);
-  if (delayMs > 0) await sleep(delayMs);
-  await sendRequiredGeminiText(chatId, result.interpretation, cards, 6);
-  return result;
-}
-
-// Gemini is the only source of the interpretation. If Telegram fails while
-// delivering Gemini's already-generated text, retry delivery, but never replace
-// it with server-generated text.
-async function sendRequiredGeminiText(chatId, text, cards, attempts = 6) {
-  let lastError;
-  const rawParts = splitForTelegram(String(text ?? ''));
-
-  for (let partIndex = 0; partIndex < rawParts.length; partIndex += 1) {
-    const part = rawParts[partIndex];
-    let delivered = false;
-    for (let attempt = 1; attempt <= attempts; attempt += 1) {
-      try {
-        const formatted = formatCardNamesHtml(part, cards);
-        const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: formatted,
-            parse_mode: 'HTML'
-          })
-        });
-        const raw = await response.text();
-        let data = null;
-        try { data = JSON.parse(raw); } catch {}
-        if (!response.ok || !data?.ok) {
-          throw new Error(data?.description || `Telegram Gemini text delivery failed (HTTP ${response.status}).`);
-        }
-        delivered = true;
-        break;
-      } catch (err) {
-        lastError = err;
-        console.error(`[tarot-omen] Gemini text delivery part ${partIndex + 1}/${rawParts.length}, attempt ${attempt}/${attempts} failed:`, err);
-        if (attempt < attempts) await sleep(attempt * 1000);
+      const image = await builder(cards);
+      if (!image || !Buffer.isBuffer(image) || image.length === 0) {
+        throw new Error(`${label} image builder returned an empty image.`);
       }
+      return image;
+    } catch (err) {
+      lastError = err;
+      console.error(`[tarot-omen] ${label} image generation attempt ${attempt}/5 failed:`, err?.message || err);
+      if (attempt < 5) await sleep(attempt * 1000);
     }
-    if (!delivered) throw lastError || new Error('Gemini text delivery failed.');
   }
+  throw lastError || new Error(`${label} image generation failed.`);
+}
+
+async function sendSpreadImageWithRetry(chatId, imageBuffer) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    try {
+      await telegramSendSpreadImage(chatId, imageBuffer);
+      return true;
+    } catch (err) {
+      lastError = err;
+      console.error(`[tarot-omen] Telegram spread image delivery attempt ${attempt}/5 failed:`, err?.message || err);
+      if (attempt < 5) await sleep(attempt * 1000);
+    }
+  }
+  throw lastError || new Error('Telegram spread image delivery failed.');
 }
 
 function normalizeProductName(value) {
@@ -1694,6 +1600,10 @@ async function handleTributeWebhook(body) {
   }
 
   if (purchaseId && processedTributePurchases.has(purchaseId)) return;
+  if (purchaseId) {
+    processedTributePurchases.add(purchaseId);
+    await savePaymentEvent(purchaseId, 'tribute');
+  }
 
   let resolved;
   try {
@@ -1732,11 +1642,6 @@ async function handleTributeWebhook(body) {
       purchaseId
     });
     return;
-  }
-
-  if (purchaseId) {
-    processedTributePurchases.add(purchaseId);
-    await savePaymentEvent(purchaseId, 'tribute');
   }
 
   let session = sessions.get(telegramUserId);
@@ -2322,16 +2227,19 @@ async function runPaidCelticReading(chatId, session, question, options = {}) {
   const conversationContext = contextParts.join('\n\n');
 
   try {
-    // Nothing is sent until BOTH Gemini and the mandatory spread image are ready.
-    const result = await prepareAndDeliverReading({
-      chatId,
-      question,
-      cards,
-      userName,
-      spreadType: 'celtic',
-      conversationContext,
-      delayMs: 1200
-    });
+    const mixingMessageIds = await telegramSendMessage(chatId, 'Мешаю карты...', true);
+    const shuffleMessageId = await telegramSendShuffleGif(chatId);
+    const interpretationPromise = generateInterpretation(question, cards, userName, 'celtic', conversationContext);
+    const spreadImagePromise = generateSpreadImageWithRetry(buildCelticCrossImage, cards, 'Celtic Cross');
+    const [result, spreadImage] = await Promise.all([interpretationPromise, spreadImagePromise]);
+
+    await sendSpreadImageWithRetry(chatId, spreadImage);
+    for (const messageId of mixingMessageIds || []) await telegramDeleteMessage(chatId, messageId);
+    await telegramDeleteMessage(chatId, shuffleMessageId);
+
+    await telegramSendMessageWithRetry(chatId, CARDS_CAPTION, 5);
+    await sleep(1500);
+    await telegramSendCardTextWithRetry(chatId, result.interpretation, cards);
 
     let followup = '';
     try {
@@ -2341,9 +2249,9 @@ async function runPaidCelticReading(chatId, session, question, options = {}) {
         cards,
         interpretation: result.interpretation
       });
-      await sendRequiredGeminiText(chatId, followup, cards, 6);
+      await telegramSendCardText(chatId, followup, cards);
     } catch (followupErr) {
-      console.error('[tarot-omen] Celtic follow-up question generation/delivery failed:', followupErr);
+      console.error('[tarot-omen] Celtic follow-up question generation failed:', followupErr);
     }
 
     session.reading = {
@@ -2369,9 +2277,7 @@ async function runPaidCelticReading(chatId, session, question, options = {}) {
     session.pendingPayment = null;
     session.pendingTributePayment = null;
   } catch (err) {
-    // Never substitute server-generated content and never send an incomplete
-    // reading. The paid entitlement remains untouched for a later retry.
-    console.error('[tarot-omen] Celtic reading could not be completed:', err);
+    console.error('[tarot-omen] Celtic reading failed before completion; no fallback result was sent:', err);
   }
 }
 
@@ -2380,15 +2286,19 @@ async function runPaidThreeCardReading(chatId, session, question) {
   const cards = drawThreeCards();
 
   try {
-    // Nothing is sent until BOTH Gemini and the mandatory spread image are ready.
-    const result = await prepareAndDeliverReading({
-      chatId,
-      question,
-      cards,
-      userName,
-      spreadType: 'three',
-      delayMs: 1200
-    });
+    const mixingMessageIds = await telegramSendMessage(chatId, 'Мешаю карты...', true);
+    const shuffleMessageId = await telegramSendShuffleGif(chatId);
+    const interpretationPromise = generateInterpretation(question, cards, userName, 'three');
+    const spreadImagePromise = generateSpreadImageWithRetry(buildReadingImage, cards, 'three-card');
+    const [result, spreadImage] = await Promise.all([interpretationPromise, spreadImagePromise]);
+
+    await sendSpreadImageWithRetry(chatId, spreadImage);
+    for (const messageId of mixingMessageIds || []) await telegramDeleteMessage(chatId, messageId);
+    await telegramDeleteMessage(chatId, shuffleMessageId);
+
+    await telegramSendMessageWithRetry(chatId, CARDS_CAPTION, 5);
+    await sleep(1500);
+    await telegramSendCardTextWithRetry(chatId, result.interpretation, cards);
 
     let followup = '';
     try {
@@ -2398,9 +2308,9 @@ async function runPaidThreeCardReading(chatId, session, question) {
         cards,
         interpretation: result.interpretation
       });
-      await sendRequiredGeminiText(chatId, followup, cards, 6);
+      await telegramSendCardText(chatId, followup, cards);
     } catch (followupErr) {
-      console.error('[tarot-omen] Paid follow-up question generation/delivery failed:', followupErr);
+      console.error('[tarot-omen] Paid follow-up question generation failed:', followupErr);
     }
 
     session.reading = {
@@ -2409,6 +2319,8 @@ async function runPaidThreeCardReading(chatId, session, question) {
       interpretation: result.interpretation,
       spreadType: 'three'
     };
+    // Keep the existing story history. A new paid spread continues the same
+    // conversation instead of resetting Omen's context. Keep the buffer bounded.
     session.history = Array.isArray(session.history) ? session.history.slice(-24) : [];
     session.paidConversationUsed = 0;
     session.paidReadingsRemaining = Math.max(0, Number(session.paidReadingsRemaining || 0) - 1);
@@ -2423,9 +2335,7 @@ async function runPaidThreeCardReading(chatId, session, question) {
     session.freeCooldownUsed = false;
     session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
   } catch (err) {
-    // Never substitute server-generated content and never send an incomplete
-    // reading. The paid entitlement remains untouched for a later retry.
-    console.error('[tarot-omen] Paid reading could not be completed:', err);
+    console.error('[tarot-omen] Paid reading failed before completion; no fallback result was sent:', err);
   }
 }
 
@@ -2550,7 +2460,8 @@ async function processTelegramUpdate(update) {
     try {
       await handleSuccessfulPayment(message);
     } catch (err) {
-      console.error('[tarot-omen] Successful payment handling failed; no incomplete reading was sent:', err);
+      console.error('[tarot-omen] Successful payment handling failed:', err);
+      await telegramSendMessage(message.chat.id, 'Платёж прошёл, но возникла техническая ошибка при запуске расклада. Напиши ещё раз, чтобы продолжить.');
     }
     return;
   }
@@ -2625,18 +2536,21 @@ async function processTelegramUpdate(update) {
         }
       }
 
-      // Keep the previous story until the new reading has been fully delivered.
+      // Clear the previous story only after a new-topic reading is actually available.
+      clearReadingStoryForNewTopic(session);
 
       if (requestedKind === 'free') {
         const cards = drawThreeCards();
-        const result = await prepareAndDeliverReading({
-          chatId,
-          question: text,
-          cards,
-          userName,
-          spreadType: 'three',
-          delayMs: 1200
-        });
+        await telegramSendMessage(chatId, 'Мешаю карты...', true);
+        await telegramSendShuffleGif(chatId);
+
+        const interpretationPromise = generateInterpretation(text, cards, userName, 'three');
+        const spreadImagePromise = generateSpreadImageWithRetry(buildReadingImage, cards, 'new-topic three-card');
+        const [result, spreadImage] = await Promise.all([interpretationPromise, spreadImagePromise]);
+        await sendSpreadImageWithRetry(chatId, spreadImage);
+        await telegramSendMessageWithRetry(chatId, CARDS_CAPTION, 5);
+        await sleep(1200);
+        await telegramSendCardTextWithRetry(chatId, result.interpretation, cards);
 
         try {
           const followup = await generateFollowupQuestion({
@@ -2645,23 +2559,22 @@ async function processTelegramUpdate(update) {
             cards,
             interpretation: result.interpretation
           });
-          await sendRequiredGeminiText(chatId, followup, cards, 6);
+          await telegramSendCardText(chatId, followup, cards);
         } catch (followupErr) {
-          console.error('[tarot-omen] New-topic free follow-up question generation/delivery failed:', followupErr);
+          console.error('[tarot-omen] New-topic free follow-up question generation failed:', followupErr);
         }
 
-        // Only replace the previous story after the complete reading was delivered.
         session.reading = {
           question: text,
           cards,
           interpretation: result.interpretation,
           spreadType: 'three'
         };
-        session.history = [];
+        session.history = Array.isArray(session.history) ? session.history.slice(-24) : [];
         session.freeConversationUsed = 0;
         session.paidConversationUsed = 0;
-        session.paidReadingActive = false;
-        session.paidContinuation = false;
+        session.paidReadingActive = hasPaidEntitlements(session);
+        session.paidContinuation = hasPaidEntitlements(session);
         session.pendingReadingQuestion = '';
         session.readingOfferShown = false;
         session.pendingGiftReading = false;
@@ -2679,10 +2592,11 @@ async function processTelegramUpdate(update) {
         await runPaidThreeCardReading(chatId, session, text);
         return;
       }
-      console.error('[tarot-omen] New topic requested but no entitlement is available.');
+      await telegramSendMessage(chatId, 'Не удалось найти доступный расклад для новой темы.');
       return;
     } catch (err) {
-      console.error('[tarot-omen] New topic reading could not be completed:', err);
+      console.error('[tarot-omen] New topic reading failed:', err);
+      await telegramSendMessage(chatId, 'Не удалось запустить расклад на новую тему. Попробуй ещё раз.');
       return;
     }
   }
@@ -2734,15 +2648,19 @@ async function processTelegramUpdate(update) {
     try {
       const continuationQuestion = session.pendingReadingQuestion || text;
       const cards = drawThreeCards();
+      await telegramSendMessage(chatId, 'Мешаю карты...', true);
+      await telegramSendShuffleGif(chatId);
 
-      const result = await prepareAndDeliverReading({
-        chatId,
-        question: continuationQuestion,
-        cards,
-        userName,
-        spreadType: 'three',
-        delayMs: 1200
-      });
+      const interpretationPromise = generateInterpretation(continuationQuestion, cards, userName, 'three');
+      const spreadImagePromise = generateSpreadImageWithRetry(buildReadingImage, cards, '72-hour three-card');
+      const [result, spreadImage] = await Promise.all([interpretationPromise, spreadImagePromise]);
+      await sendSpreadImageWithRetry(chatId, spreadImage);
+      await telegramSendMessageWithRetry(chatId, CARDS_CAPTION, 5);
+      await sleep(1200);
+
+      // The 72-hour free continuation stays text-only. Voice is reserved for
+      // the first free reading and paid readings.
+      await telegramSendCardTextWithRetry(chatId, result.interpretation, cards);
 
       try {
         const followup = await generateFollowupQuestion({
@@ -2751,9 +2669,9 @@ async function processTelegramUpdate(update) {
           cards,
           interpretation: result.interpretation
         });
-        await sendRequiredGeminiText(chatId, followup, cards, 6);
+        await telegramSendCardText(chatId, followup, cards);
       } catch (followupErr) {
-        console.error('[tarot-omen] 72h follow-up question generation/delivery failed:', followupErr);
+        console.error('[tarot-omen] 72h follow-up question generation failed:', followupErr);
       }
 
       session.reading = {
@@ -2762,7 +2680,7 @@ async function processTelegramUpdate(update) {
         interpretation: result.interpretation,
         spreadType: 'three'
       };
-      session.history = [];
+      session.history = Array.isArray(session.history) ? session.history.slice(-24) : [];
       session.freeConversationUsed = 0;
       session.paidConversationUsed = 0;
       session.paidReadingActive = false;
@@ -2775,7 +2693,7 @@ async function processTelegramUpdate(update) {
       session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
       return;
     } catch (err) {
-      console.error('[tarot-omen] Free 72-hour continuation reading could not be completed:', err);
+      console.error('[tarot-omen] Free 72-hour continuation failed before completion; no fallback result was sent:', err);
       return;
     }
   }
@@ -2933,18 +2851,26 @@ async function processTelegramUpdate(update) {
 
   try {
     // ===== NEW FREE THREE-CARD READING =====
-    // Do not send any part of the reading until Gemini and the mandatory image
-    // are both ready. The cards are represented only by the spread image.
     const cards = drawThreeCards();
-    const result = await prepareAndDeliverReading({
-      chatId,
-      question: text,
-      cards,
-      userName,
-      spreadType: 'three',
-      delayMs: 1500
-    });
+    const mixingMessageIds = await telegramSendMessage(chatId, 'Мешаю карты...', true);
+    const shuffleMessageId = await telegramSendShuffleGif(chatId);
 
+    const interpretationPromise = generateInterpretation(text, cards, userName);
+    const spreadImagePromise = generateSpreadImageWithRetry(buildReadingImage, cards, 'free three-card');
+    const [result, spreadImage] = await Promise.all([interpretationPromise, spreadImagePromise]);
+
+    await sendSpreadImageWithRetry(chatId, spreadImage);
+
+    for (const messageId of mixingMessageIds || []) await telegramDeleteMessage(chatId, messageId);
+    await telegramDeleteMessage(chatId, shuffleMessageId);
+
+    await telegramSendMessageWithRetry(chatId, CARDS_CAPTION, 5);
+    await sleep(2000);
+
+    await telegramSendCardTextWithRetry(chatId, result.interpretation, cards);
+
+    // Every completed spread gets a separate, context-aware question that invites
+    // the user to continue the conversation. It is text-only and never goes to ElevenLabs.
     try {
       const followup = await generateFollowupQuestion({
         userName,
@@ -2952,9 +2878,9 @@ async function processTelegramUpdate(update) {
         cards,
         interpretation: result.interpretation
       });
-      await sendRequiredGeminiText(chatId, followup, cards, 6);
+      await telegramSendCardText(chatId, followup, cards);
     } catch (followupErr) {
-      console.error('[tarot-omen] Follow-up question generation/delivery failed:', followupErr);
+      console.error('[tarot-omen] Follow-up question generation failed:', followupErr);
     }
 
     sessions.set(chatId, {
@@ -2982,15 +2908,12 @@ async function processTelegramUpdate(update) {
       readingOfferShown: false,
       pendingReadingQuestion: '',
       pendingPayment: null,
-      pendingTributePayment: null,
       freeReadingUsed: true,
       freeCooldownUsed: false,
       freeCooldownAvailableAt: Date.now() + FREE_COOLDOWN_MS
     });
   } catch (err) {
-    // Never substitute server-generated content or send an incomplete result.
-    // No user-facing error is emitted from the reading pipeline.
-    console.error('[tarot-omen] Initial free reading could not be completed:', err);
+    console.error('[tarot-omen] Free reading failed before completion; no fallback result was sent:', err);
   }
 }
 
