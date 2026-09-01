@@ -1346,6 +1346,9 @@ async function telegramSendSpreadImage(chatId, imageBuffer) {
     new Blob([imageBuffer], { type: 'image/png' }),
     'tarot-spread.png'
   );
+  // The caption belongs to the image itself, so it cannot disappear
+  // independently between successful image delivery and a second message.
+  form.append('caption', CARDS_CAPTION);
 
   const response = await fetch(`${TELEGRAM_API}/sendPhoto`, {
     method: 'POST',
@@ -2237,8 +2240,6 @@ async function runPaidCelticReading(chatId, session, question, options = {}) {
 
     for (const messageId of mixingMessageIds || []) await telegramDeleteMessage(chatId, messageId);
     await telegramDeleteMessage(chatId, shuffleMessageId);
-
-    await telegramSendMessageWithRetry(chatId, CARDS_CAPTION, 5);
     await sleep(1500);
 
     // Interpretation comes only from Gemini. No server-generated fallback exists.
@@ -2336,8 +2337,6 @@ async function runPaidThreeCardReading(chatId, session, question, options = {}) 
 
     for (const messageId of mixingMessageIds || []) await telegramDeleteMessage(chatId, messageId);
     await telegramDeleteMessage(chatId, shuffleMessageId);
-
-    await telegramSendMessageWithRetry(chatId, CARDS_CAPTION, 5);
     await sleep(2000);
 
     // Only Gemini supplies the interpretation. There is no server fallback.
@@ -2630,8 +2629,6 @@ async function processTelegramUpdate(update) {
 
         for (const messageId of mixingMessageIds || []) await telegramDeleteMessage(chatId, messageId);
         await telegramDeleteMessage(chatId, shuffleMessageId);
-
-        await telegramSendMessageWithRetry(chatId, CARDS_CAPTION, 5);
         await sleep(1200);
         await runWithRetry(
           'New-topic free Gemini interpretation delivery',
@@ -2763,8 +2760,6 @@ async function processTelegramUpdate(update) {
 
       for (const messageId of mixingMessageIds || []) await telegramDeleteMessage(chatId, messageId);
       await telegramDeleteMessage(chatId, shuffleMessageId);
-
-      await telegramSendMessageWithRetry(chatId, CARDS_CAPTION, 5);
       await sleep(1200);
 
       await runWithRetry(
@@ -2988,8 +2983,6 @@ async function processTelegramUpdate(update) {
 
     for (const messageId of mixingMessageIds || []) await telegramDeleteMessage(chatId, messageId);
     await telegramDeleteMessage(chatId, shuffleMessageId);
-
-    await telegramSendMessageWithRetry(chatId, CARDS_CAPTION, 5);
     await sleep(2000);
 
     await runWithRetry(
