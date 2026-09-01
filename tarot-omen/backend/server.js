@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import sharp from 'sharp';
 import { createHmac, timingSafeEqual } from 'node:crypto';
+import pg from 'pg';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -681,8 +682,132 @@ async function buildCelticCrossImage(cards) {
     .toBuffer();
 }
 // ===== CONVERSATION SESSIONS =====
-// MVP storage: in-memory. A Render restart clears sessions.
+// Persistent storage lives in Render PostgreSQL when DATABASE_URL is configured.
+// The in-memory Map remains a fast runtime cache, while PostgreSQL is the source
+// of truth so Render deploys/restarts do not erase user state.
 const sessions = new Map();
+const DATABASE_URL = process.env.DATABASE_URL || '';
+
+let dbPool = null;
+let dbReady = false;
+
+async function initDatabase() {
+  if (!DATABASE_URL) {
+    console.warn('[tarot-omen] DATABASE_URL is not set. Sessions will remain in memory only.');
+    return;
+  }
+
+  const { Pool } = pg;
+  dbPool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+    max: 5,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000
+  });
+
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS telegram_sessions (
+      chat_id TEXT PRIMARY KEY,
+      session JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS processed_payment_events (
+      event_id TEXT PRIMARY KEY,
+      event_type TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  const result = await dbPool.query('SELECT chat_id, session FROM telegram_sessions');
+
+  for (const row of result.rows) {
+    try {
+      const session = row.session && typeof row.session === 'object'
+        ? row.session
+        : JSON.parse(row.session);
+      session.newTopicInfoPromise = null;
+      sessions.set(Number(row.chat_id), session);
+    } catch (err) {
+      console.error('[tarot-omen] Failed to restore session:', row.chat_id, err);
+    }
+  }
+
+  const events = await dbPool.query(
+    'SELECT event_id, event_type FROM processed_payment_events'
+  );
+
+  for (const row of events.rows) {
+    if (row.event_type === 'stars') processedPaymentCharges.add(row.event_id);
+    if (row.event_type === 'tribute') processedTributePurchases.add(row.event_id);
+  }
+
+  dbReady = true;
+  console.log(`[tarot-omen] PostgreSQL ready. Restored ${result.rowCount} sessions and ${events.rowCount} processed payment events.`);
+}
+
+function serializableSession(session) {
+  if (!session) return null;
+  const copy = { ...session };
+  delete copy.newTopicInfoPromise;
+  return copy;
+}
+
+async function saveSession(chatId, session = sessions.get(chatId)) {
+  if (!dbReady || !dbPool || !chatId || !session) return;
+
+  try {
+    await dbPool.query(
+      `INSERT INTO telegram_sessions (chat_id, session, updated_at)
+       VALUES ($1, $2::jsonb, NOW())
+       ON CONFLICT (chat_id)
+       DO UPDATE SET session = EXCLUDED.session, updated_at = NOW()`,
+      [String(chatId), JSON.stringify(serializableSession(session))]
+    );
+  } catch (err) {
+    console.error('[tarot-omen] Failed to save session:', chatId, err);
+  }
+}
+
+async function loadSession(chatId) {
+  if (!chatId || !dbReady || !dbPool) return sessions.get(chatId) || null;
+  if (sessions.has(chatId)) return sessions.get(chatId);
+
+  try {
+    const result = await dbPool.query(
+      'SELECT session FROM telegram_sessions WHERE chat_id = $1',
+      [String(chatId)]
+    );
+
+    if (!result.rowCount) return null;
+
+    const session = result.rows[0].session;
+    session.newTopicInfoPromise = null;
+    sessions.set(chatId, session);
+    return session;
+  } catch (err) {
+    console.error('[tarot-omen] Failed to load session:', chatId, err);
+    return sessions.get(chatId) || null;
+  }
+}
+
+async function savePaymentEvent(eventId, eventType) {
+  if (!eventId || !dbReady || !dbPool) return;
+
+  try {
+    await dbPool.query(
+      `INSERT INTO processed_payment_events (event_id, event_type)
+       VALUES ($1, $2)
+       ON CONFLICT (event_id) DO NOTHING`,
+      [String(eventId), String(eventType)]
+    );
+  } catch (err) {
+    console.error('[tarot-omen] Failed to save processed payment event:', eventId, err);
+  }
+}
 
 // Current product prices. Paid reading packages never expire by time; only usage reduces
 // their remaining entitlements.
@@ -1439,7 +1564,10 @@ async function handleTributeWebhook(body) {
   }
 
   if (purchaseId && processedTributePurchases.has(purchaseId)) return;
-  if (purchaseId) processedTributePurchases.add(purchaseId);
+  if (purchaseId) {
+    processedTributePurchases.add(purchaseId);
+    await savePaymentEvent(purchaseId, 'tribute');
+  }
 
   let resolved;
   try {
@@ -1711,16 +1839,22 @@ function clearReadingStoryForNewTopic(session) {
   session.pendingPaidReadingKind = '';
   session.paidConversationUsed = 0;
   session.newTopicInfoMessageId = 0;
+  session.newTopicInfoText = '';
+  session.newTopicInfoUnavailableShown = false;
 }
 
 async function showNewTopicInfo(chatId, session, text) {
-  // Telegram can deliver several callback queries when a user taps the same
-  // button repeatedly before the first request finishes. Without a per-session
-  // lock, every callback can see newTopicInfoMessageId === 0 and send another
-  // identical message. Serialize this operation so only one info message can
-  // exist for the current session.
+  // Keep exactly one logical info message for this session. Repeated presses
+  // must not create or re-show duplicate copies of the same message.
   if (session.newTopicInfoPromise) {
     return session.newTopicInfoPromise;
+  }
+
+  if (
+    Number(session?.newTopicInfoMessageId || 0) &&
+    session?.newTopicInfoText === text
+  ) {
+    return;
   }
 
   session.newTopicInfoPromise = (async () => {
@@ -1729,16 +1863,17 @@ async function showNewTopicInfo(chatId, session, text) {
     if (existingMessageId) {
       try {
         await telegramEditMessageTextWithRetry(chatId, existingMessageId, text, []);
+        session.newTopicInfoText = text;
         return;
       } catch (err) {
-        // The old message may have been deleted by Telegram or by the user.
-        // Clear the stale id and create one clean replacement.
         session.newTopicInfoMessageId = 0;
+        session.newTopicInfoText = '';
       }
     }
 
     const messageIds = await telegramSendMessageWithRetry(chatId, text, 3, true);
     session.newTopicInfoMessageId = Number(messageIds?.[0] || 0);
+    session.newTopicInfoText = text;
   })();
 
   try {
@@ -1751,13 +1886,13 @@ async function showNewTopicInfo(chatId, session, text) {
 async function handleNewTopicRequest(chatId, session) {
   if (!session) return;
 
-  const preferredKind = Number(session.paidReadingsRemaining || 0) > 0
-    ? 'reading'
-    : Number(session.paidCelticRemaining || 0) > 0
-      ? 'celtic'
-      : '';
+  const paidReadingAvailable = Number(session.paidReadingsRemaining || 0) > 0;
+  const paidCelticAvailable = Number(session.paidCelticRemaining || 0) > 0;
+  const freeAvailable = !!session.reading &&
+    Date.now() >= Number(session.freeCooldownAvailableAt || 0);
 
-  if (preferredKind) {
+  if (paidReadingAvailable || paidCelticAvailable) {
+    const preferredKind = paidReadingAvailable ? 'reading' : 'celtic';
     session.pendingNewTopic = true;
     session.pendingNewTopicKind = preferredKind;
     session.readingOfferShown = false;
@@ -1774,10 +1909,7 @@ async function handleNewTopicRequest(chatId, session) {
     return;
   }
 
-  // The same button can start a genuinely new free reading once the 72-hour
-  // entitlement has become available. Without the button, ordinary text keeps
-  // following the existing story and the normal 72-hour continuation logic.
-  if (session?.reading && Date.now() >= Number(session.freeCooldownAvailableAt || 0)) {
+  if (freeAvailable) {
     session.pendingNewTopic = true;
     session.pendingNewTopicKind = 'free';
     session.readingOfferShown = false;
@@ -1792,13 +1924,17 @@ async function handleNewTopicRequest(chatId, session) {
     return;
   }
 
-  await showNewTopicInfo(
-    chatId,
-    session,
-    'Для новой темы можно приобрести новый расклад выше или, если не спешишь, подождать 72 часа после последнего использованного расклада. Тогда снова будет доступен бесплатный расклад.'
-  );
-}
+  session.pendingNewTopic = false;
+  session.pendingNewTopicKind = '';
 
+  const unavailableText =
+    'Для новой темы можно приобрести новый расклад или, если не спешишь, подождать 72 часа после последнего использованного расклада. Тогда снова будет доступен бесплатный расклад.';
+
+  if (!session.newTopicInfoUnavailableShown) {
+    await showNewTopicInfo(chatId, session, unavailableText);
+    session.newTopicInfoUnavailableShown = true;
+  }
+}
 async function telegramSendInvoice(chatId, { title, description, stars, payload }) {
   const amount = Number(stars);
 
@@ -1995,7 +2131,10 @@ async function handleSuccessfulPayment(message) {
   }
 
   if (chargeId && processedPaymentCharges.has(chargeId)) return true;
-  if (chargeId) processedPaymentCharges.add(chargeId);
+  if (chargeId) {
+    processedPaymentCharges.add(chargeId);
+    await savePaymentEvent(chargeId, 'stars');
+  }
 
   const pending = session.pendingPayment;
   session.pendingPayment = null;
@@ -2181,7 +2320,7 @@ async function sendStartMessage(chatId) {
   }
 }
 
-async function handleTelegramUpdate(update) {
+async function processTelegramUpdate(update) {
   if (update?.pre_checkout_query) {
     try {
       await handlePreCheckoutQuery(update.pre_checkout_query);
@@ -2354,15 +2493,23 @@ async function handleTelegramUpdate(update) {
 
     session.pendingNewTopic = false;
     session.pendingNewTopicKind = '';
-    clearReadingStoryForNewTopic(session);
 
     try {
       if (requestedKind === 'free') {
         if (Date.now() < Number(session.freeCooldownAvailableAt || 0)) {
-          await telegramSendMessage(chatId, 'Бесплатный расклад на новую тему пока ещё недоступен. Можно подождать 72 часа после последнего использованного расклада.');
+          await showNewTopicInfo(
+            chatId,
+            session,
+            'Для новой темы можно приобрести новый расклад или, если не спешишь, подождать 72 часа после последнего использованного расклада. Тогда снова будет доступен бесплатный расклад.'
+          );
           return;
         }
+      }
 
+      // Clear the previous story only after a new-topic reading is actually available.
+      clearReadingStoryForNewTopic(session);
+
+      if (requestedKind === 'free') {
         const cards = drawThreeCards();
         await telegramSendMessage(chatId, 'Мешаю карты...', true);
         await telegramSendShuffleGif(chatId);
@@ -2748,6 +2895,29 @@ async function handleTelegramUpdate(update) {
   }
 }
 
+function getUpdateChatId(update) {
+  if (update?.message?.chat?.id) return Number(update.message.chat.id);
+  if (update?.callback_query?.message?.chat?.id) return Number(update.callback_query.message.chat.id);
+  if (update?.pre_checkout_query?.from?.id) return Number(update.pre_checkout_query.from.id);
+  return null;
+}
+
+async function handleTelegramUpdate(update) {
+  const chatId = getUpdateChatId(update);
+
+  if (chatId) {
+    await loadSession(chatId);
+  }
+
+  try {
+    await processTelegramUpdate(update);
+  } finally {
+    if (chatId) {
+      await saveSession(chatId);
+    }
+  }
+}
+
 app.post('/tribute-webhook', (req, res) => {
   if (!tributeSignatureMatches(req)) {
     return res.status(401).json({ error: 'Invalid webhook signature.' });
@@ -2755,9 +2925,16 @@ app.post('/tribute-webhook', (req, res) => {
 
   res.status(200).json({ status: 'ok' });
 
-  handleTributeWebhook(req.body).catch((err) => {
-    console.error('[tarot-omen] Tribute webhook handler error:', err);
-  });
+  handleTributeWebhook(req.body)
+    .then(async () => {
+      const telegramUserId = Number(req.body?.payload?.telegram_user_id);
+      if (Number.isSafeInteger(telegramUserId) && telegramUserId > 0) {
+        await saveSession(telegramUserId);
+      }
+    })
+    .catch((err) => {
+      console.error('[tarot-omen] Tribute webhook handler error:', err);
+    });
 });
 
 app.get('/tribute-webhook', (_req, res) => {
@@ -2781,7 +2958,7 @@ async function setupTelegramWebhook() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         url: TELEGRAM_WEBHOOK_URL,
-        drop_pending_updates: true
+        drop_pending_updates: false
       })
     });
 
@@ -2800,12 +2977,34 @@ async function setupTelegramWebhook() {
   }
 }
 
-app.listen(PORT, () => {
-  console.log(`[tarot-omen] backend listening on port ${PORT}`);
-  setupTelegramWebhook();
-  if (TRIBUTE_API_KEY) {
-    tributeResolveProducts(true).catch((err) => {
-      console.error('[tarot-omen] Tribute product auto-discovery failed at startup:', err);
-    });
+async function startServer() {
+  try {
+    await initDatabase();
+  } catch (err) {
+    console.error('[tarot-omen] PostgreSQL initialization failed:', err);
+    dbReady = false;
+    if (dbPool) {
+      try { await dbPool.end(); } catch {}
+      dbPool = null;
+    }
+    if (DATABASE_URL) {
+      console.error('[tarot-omen] DATABASE_URL is configured, so startup is stopped to prevent running without persistent storage.');
+      process.exit(1);
+    }
   }
+
+  app.listen(PORT, () => {
+    console.log(`[tarot-omen] backend listening on port ${PORT}`);
+    setupTelegramWebhook();
+    if (TRIBUTE_API_KEY) {
+      tributeResolveProducts(true).catch((err) => {
+        console.error('[tarot-omen] Tribute product auto-discovery failed at startup:', err);
+      });
+    }
+  });
+}
+
+startServer().catch((err) => {
+  console.error('[tarot-omen] Fatal startup error:', err);
+  process.exit(1);
 });
