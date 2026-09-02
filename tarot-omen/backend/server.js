@@ -96,9 +96,21 @@ function userGenderGuidance(firstName) {
   if (gender === 'male') {
     return 'По доступному имени пользователя род явно мужской. Обращайся к пользователю в мужском грамматическом роде, когда это естественно.';
   }
-  return 'Пол пользователя по имени неясен. Не угадывай его: по возможности избегай формулировок, требующих выбора рода. Если без рода не обойтись, используй мужской род как запасной вариант.';
+  return 'РЕЖИМ ОБРАЩЕНИЯ: НЕЙТРАЛЬНЫЙ. Род пользователя НЕ определён и НЕ должен угадываться по имени, контексту или содержанию разговора. Категорически избегай форм мужского и женского рода по отношению к пользователю, если предложение можно перестроить: например, «тебе пришлось», «ты сейчас в ситуации», «у тебя появилось ощущение». Не используй «ты сделал/сделала», «ты понял/поняла», «ты оказался/оказалась», «ты сам/сама», «тебе привычен/привычна» и подобные пары. Если грамматически без рода абсолютно невозможно обойтись, используй мужской род как запасной вариант. Это правило касается ТОЛЬКО пользователя; Омен всегда говорит о себе в женском роде.';
 }
 
+
+const ADMIN_TEST_USERNAME = 'flash_royalevich';
+
+function isAdminTestUser(telegramUser) {
+  const username = String(telegramUser?.username || '').trim().replace(/^@/, '').toLowerCase();
+  return username === ADMIN_TEST_USERNAME;
+}
+
+function ensureAdminTestEntitlement(session) {
+  if (!session || hasPaidEntitlements(session)) return;
+  activatePaidPackage(session, 'reading');
+}
 
 function capText(text, maxLen) {
   if (text.length <= maxLen) return text;
@@ -111,7 +123,7 @@ function capText(text, maxLen) {
 
 const SYSTEM_PROMPT = `You are the reading voice of Tarot Omen, a Tarot mini app.
 
-Speak naturally to one person. Omen is a woman and always speaks about herself in the feminine grammatical gender in Russian and other languages where grammatical gender applies. Use feminine first-person forms when referring to Omen herself (for example: «я заметила», «я почувствовала», «я бы сказала», «я подумала»). Never use masculine forms for Omen. The user's grammatical gender is supplied separately in the user message. Follow that instruction: use feminine forms for the user only when the supplied Telegram name is clearly feminine, masculine forms only when it is clearly masculine; when unclear, avoid gendered forms and use masculine only as a fallback. Do not guess beyond that guidance.
+Speak naturally to one person. Omen is a woman and always speaks about herself in the feminine grammatical gender in Russian and other languages where grammatical gender applies. Use feminine first-person forms when referring to Omen herself (for example: «я заметила», «я почувствовала», «я бы сказала», «я подумала»). Never use masculine forms for Omen. The user's grammatical gender is supplied separately in the user message as an explicit instruction. Treat it as authoritative. If it says female, feminine forms for the user are allowed; if it says male, masculine forms are allowed. If it says neutral/unknown, do NOT choose a gender from context or from the name yourself: rewrite sentences to avoid gendered forms, and use masculine only when a gendered form is absolutely unavoidable. This user-gender rule is completely separate from Omen's own feminine gender.
 
 You receive: a user's question and an already-drawn Tarot spread. The cards were chosen by a random generator before you were called. You never choose or invent cards.
 
@@ -959,7 +971,7 @@ Rules:
 - Never invent facts about the user's life.
 - Never claim certainty about the future.
 - Omen is a woman. Always speak about yourself in the feminine grammatical gender in Russian and other languages where grammatical gender applies. For example: «я заметила», «я почувствовала», «я бы сказала», «я подумала». Never use masculine forms when referring to Omen herself.
-- Use the supplied user gender guidance. If the Telegram name is clearly feminine, address the user in feminine grammatical forms when natural; if clearly masculine, use masculine forms. If the name is ambiguous or a pseudonym, avoid gendered forms where possible; if unavoidable, use masculine as the fallback. Do not invent a gender beyond this guidance. Use the Telegram first name only when it sounds natural.
+- Use the supplied user gender guidance as authoritative. If it says female, address the user in feminine grammatical forms when natural; if male, use masculine forms. If it says neutral/unknown, do not infer a gender from context, name, topic or wording; avoid gendered forms, with masculine only as an unavoidable fallback. This is independent of Omen's feminine self-reference.
 - If the user reveals a genuinely new layer that would benefit from another spread, set reading_offer to true and formulate one specific reading_question for that new layer. This is only a signal for the server; NEVER sell, charge, or end the conversation yourself. Do not mention payment, credits, limits or sales inside reply or next_message.
 - If there is no genuinely new layer, continue the conversation naturally around the EXISTING reading.
 - A new user question does NOT automatically mean a new Tarot spread. Never generate or imply a new spread in this stage.
@@ -2545,6 +2557,7 @@ async function processTelegramUpdate(update) {
   if (callback) {
     const chatId = callback.message?.chat?.id;
     const session = sessions.get(chatId);
+    if (session && callback.from?.username) session.telegramUsername = String(callback.from.username).trim();
     try {
       if (callback.data === 'buy:celtic') {
         if (!session?.reading) {
@@ -2555,7 +2568,7 @@ async function processTelegramUpdate(update) {
         if (!session?.reading) {
           throw new Error('Сначала нужен основной расклад.');
         }
-        await offerAvailablePaidReadings(chatId, session);
+        await offerCelticBackOptions(chatId, session, callback.message?.message_id);
       } else if (callback.data === 'choose:celtic:payment') {
         if (!session?.reading) {
           throw new Error('Сначала нужен основной расклад.');
@@ -2644,18 +2657,37 @@ async function processTelegramUpdate(update) {
         } else {
           throw new Error('Для продолжения пока нет доступного обычного расклада.');
         }
-      } else if (callback.data === 'pay:stars:reading') {
-        await createPaymentInvoice(chatId, session, 'reading', 'STARS');
-        await deleteCallbackMessage(callback);
-      } else if (callback.data === 'pay:stars:celtic') {
-        await createPaymentInvoice(chatId, session, 'celtic', 'STARS');
-        await deleteCallbackMessage(callback);
-      } else if (callback.data === 'pay:tribute:reading') {
-        await createPaymentInvoice(chatId, session, 'reading', 'RUB');
-        await deleteCallbackMessage(callback);
-      } else if (callback.data === 'pay:tribute:celtic') {
-        await createPaymentInvoice(chatId, session, 'celtic', 'RUB');
-        await deleteCallbackMessage(callback);
+      } else if (callback.data === 'pay:stars:reading' || callback.data === 'pay:tribute:reading' ||
+                 callback.data === 'pay:stars:celtic' || callback.data === 'pay:tribute:celtic') {
+        const isAdminPurchase = isAdminTestUser(callback.from);
+        const purchaseKind = callback.data.includes(':celtic') ? 'celtic' : 'reading';
+        if (isAdminPurchase) {
+          if (!session?.reading) throw new Error('Сначала нужен основной расклад.');
+          const question = session.pendingReadingQuestion || session.reading.question ||
+            'Посмотреть следующий слой этой истории';
+          session.pendingPayment = null;
+          session.pendingTributePayment = null;
+          session.pendingGiftReading = false;
+          session.pendingPaidReadingKind = '';
+          session.pendingReadingQuestion = '';
+          activatePaidPackage(session, purchaseKind);
+          await deleteCallbackMessage(callback);
+          await telegramSendMessage(
+            chatId,
+            purchaseKind === 'celtic'
+              ? 'Тестовая оплата подтверждена. Получен 1 Кельтский крест и 2 обычных расклада в подарок. Запускаю Кельтский крест.'
+              : 'Тестовая оплата подтверждена. Получены 5 обычных раскладов. Запускаю первый.'
+          );
+          if (purchaseKind === 'celtic') {
+            await runPaidCelticReading(chatId, session, question, { test: true });
+          } else {
+            await runPaidThreeCardReading(chatId, session, question, { test: true });
+          }
+        } else {
+          const currency = callback.data.startsWith('pay:tribute:') ? 'RUB' : 'STARS';
+          await createPaymentInvoice(chatId, session, purchaseKind, currency);
+          await deleteCallbackMessage(callback);
+        }
       } else if (callback.data === 'payment:back') {
         if (!session) throw new Error('Сначала нужен расклад.');
         if (session.pendingPayment?.messageId === callback.message?.message_id) {
@@ -2691,8 +2723,26 @@ async function processTelegramUpdate(update) {
         await handleNewTopicRequest(chatId, session);
       } else if (callback.data === 'pay:reading' || callback.data === 'pay:celtic') {
         const kind = callback.data === 'pay:celtic' ? 'celtic' : 'reading';
-        await createPaymentInvoice(chatId, session, kind, 'STARS');
-        await deleteCallbackMessage(callback);
+        if (isAdminTestUser(callback.from)) {
+          if (!session?.reading) throw new Error('Сначала нужен основной расклад.');
+          const question = session.pendingReadingQuestion || session.reading.question ||
+            'Посмотреть следующий слой этой истории';
+          session.pendingPayment = null;
+          session.pendingTributePayment = null;
+          activatePaidPackage(session, kind);
+          await deleteCallbackMessage(callback);
+          await telegramSendMessage(
+            chatId,
+            kind === 'celtic'
+              ? 'Тестовая оплата подтверждена. Получен 1 Кельтский крест и 2 обычных расклада в подарок. Запускаю Кельтский крест.'
+              : 'Тестовая оплата подтверждена. Получены 5 обычных раскладов. Запускаю первый.'
+          );
+          if (kind === 'celtic') await runPaidCelticReading(chatId, session, question, { test: true });
+          else await runPaidThreeCardReading(chatId, session, question, { test: true });
+        } else {
+          await createPaymentInvoice(chatId, session, kind, 'STARS');
+          await deleteCallbackMessage(callback);
+        }
       }
     } catch (err) {
       console.error('[tarot-omen] Payment button handling failed:', {
@@ -2737,6 +2787,7 @@ async function processTelegramUpdate(update) {
   const chatId = message.chat.id;
   const text = String(message.text || '').trim();
   const userName = String(message.from?.first_name || '').trim();
+  const telegramUsername = String(message.from?.username || '').trim();
 
   if (!text) return;
 
@@ -2746,6 +2797,7 @@ async function processTelegramUpdate(update) {
     if (!sessions.has(chatId)) {
       sessions.set(chatId, {
         userName,
+        telegramUsername,
         reading: null,
         history: [],
         freeConversationUsed: 0,
@@ -2766,6 +2818,10 @@ async function processTelegramUpdate(update) {
       });
     } else {
       sessions.get(chatId).userName = userName || sessions.get(chatId).userName || '';
+      sessions.get(chatId).telegramUsername = telegramUsername || sessions.get(chatId).telegramUsername || '';
+    }
+    if (sessions.has(chatId) && isAdminTestUser({ username: telegramUsername })) {
+      ensureAdminTestEntitlement(sessions.get(chatId));
     }
     await sendStartMessage(chatId);
     return;
@@ -2776,6 +2832,10 @@ async function processTelegramUpdate(update) {
   }
 
   const session = sessions.get(chatId);
+  if (session) {
+    session.telegramUsername = telegramUsername || session.telegramUsername || '';
+    if (isAdminTestUser({ username: telegramUsername })) ensureAdminTestEntitlement(session);
+  }
 
   // ===== NEW TOPIC MODE =====
   // Entered only by the explicit 'new topic' button. Without it, the existing
@@ -3152,8 +3212,11 @@ async function processTelegramUpdate(update) {
       console.error('[tarot-omen] Follow-up question generation failed:', followupErr);
     }
 
+    const previousSession = sessions.get(chatId) || {};
     sessions.set(chatId, {
+      ...previousSession,
       userName,
+      telegramUsername: telegramUsername || previousSession.telegramUsername || '',
       reading: {
         question: text,
         cards,
@@ -3163,9 +3226,6 @@ async function processTelegramUpdate(update) {
       history: [],
       freeConversationUsed: 0,
       paidConversationUsed: 0,
-      paidReadingsRemaining: 0,
-      paidCelticRemaining: 0,
-      paidReadingActive: false,
       paidPackageKind: 'reading',
       pendingGiftReading: false,
       pendingPaidReadingKind: '',
