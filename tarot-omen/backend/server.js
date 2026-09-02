@@ -53,6 +53,53 @@ function rateLimited(key) {
 
 const MAX_INTERPRETATION_CHARS = 3000;
 
+// Determine the user's grammatical gender only when the Telegram first name
+// gives us a reasonably clear signal. Pseudonyms/ambiguous names stay neutral.
+const FEMALE_FIRST_NAMES = new Set([
+  'анна','алла','алёна','алена','александра','алина','альбина','амина','анастасия','ангелина','арина',
+  'валентина','валерия','варвара','вера','вероника','виктория','галина','дарья','диана','евгения','екатерина',
+  'елена','елизавета','жанна','зоя','инна','ирина','карина','каролина','кира','кристина','ксения','лариса',
+  'лидия','лилия','любовь','людмила','маргарита','марина','мария','марта','милана','мирослава','надежда',
+  'наталья','нина','ольга','оксана','полина','раиса','регина','светлана','софия','софья','таисия','тамара',
+  'татьяна','ульяна','юлия','юлия','яна','элина','эмма','диана','мелания','алиcа','алиса'
+]);
+const MALE_FIRST_NAMES = new Set([
+  'александр','алексей','альберт','амир','андрей','антон','аркадий','арсений','артём','артем','артур','богдан',
+  'борис','вадим','валентин','валерий','василий','виктор','виталий','влад','владимир','владислав','вячеслав',
+  'геннадий','георгий','глеб','григорий','даниил','данил','денис','дмитрий','евгений','егор','илья','иван',
+  'игорь','кирилл','константин','леонид','максим','марк','матвей','михаил','никита','николай','олег','павел',
+  'пётр','петр','платон','роман','руслан','сергей','семён','семен','станислав','степан','тимофей','тимур',
+  'фёдор','федор','юрий','ярослав','арсен','эмиль','эдуард','эрнест','эрнест','александр'
+]);
+
+function normalizeFirstName(name) {
+  return String(name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/ё/g, 'е')
+    .replace(/[^a-zа-я-]/gi, '');
+}
+
+function inferUserGender(firstName) {
+  const normalized = normalizeFirstName(firstName);
+  if (!normalized) return 'unknown';
+  if (FEMALE_FIRST_NAMES.has(normalized)) return 'female';
+  if (MALE_FIRST_NAMES.has(normalized)) return 'male';
+  return 'unknown';
+}
+
+function userGenderGuidance(firstName) {
+  const gender = inferUserGender(firstName);
+  if (gender === 'female') {
+    return 'По доступному имени пользователя род явно женский. Обращайся к пользователю в женском грамматическом роде, когда это естественно.';
+  }
+  if (gender === 'male') {
+    return 'По доступному имени пользователя род явно мужской. Обращайся к пользователю в мужском грамматическом роде, когда это естественно.';
+  }
+  return 'Пол пользователя по имени неясен. Не угадывай его: по возможности избегай формулировок, требующих выбора рода. Если без рода не обойтись, используй мужской род как запасной вариант.';
+}
+
+
 function capText(text, maxLen) {
   if (text.length <= maxLen) return text;
   const slice = text.slice(0, maxLen);
@@ -64,7 +111,7 @@ function capText(text, maxLen) {
 
 const SYSTEM_PROMPT = `You are the reading voice of Tarot Omen, a Tarot mini app.
 
-Speak naturally to one person. Omen is a woman and always speaks about herself in the feminine grammatical gender in Russian and other languages where grammatical gender applies. Use feminine first-person forms when referring to Omen herself (for example: «я заметила», «я почувствовала», «я бы сказала», «я подумала»). Never use masculine forms for Omen. The user's gender must never be inferred or mentioned; address the user neutrally.
+Speak naturally to one person. Omen is a woman and always speaks about herself in the feminine grammatical gender in Russian and other languages where grammatical gender applies. Use feminine first-person forms when referring to Omen herself (for example: «я заметила», «я почувствовала», «я бы сказала», «я подумала»). Never use masculine forms for Omen. The user's grammatical gender is supplied separately in the user message. Follow that instruction: use feminine forms for the user only when the supplied Telegram name is clearly feminine, masculine forms only when it is clearly masculine; when unclear, avoid gendered forms and use masculine only as a fallback. Do not guess beyond that guidance.
 
 You receive: a user's question and an already-drawn Tarot spread. The cards were chosen by a random generator before you were called. You never choose or invent cards.
 
@@ -155,7 +202,7 @@ async function generateInterpretation(question, cards, userName = '', spreadType
   const contextBlock = spreadType === 'celtic' && conversationContext
     ? `\n\nPrevious conversation context from the same story:\n${conversationContext}`
     : '';
-  const userMessage = `Telegram first name: ${userName || '(not available)'}\nNever infer gender. Use the name only if natural.\n\nSpread type: ${spreadLabel}\n\nUser's question:\n"${question.trim()}"${contextBlock}\n\nDrawn spread:\n\n${cardBlock}`;
+  const userMessage = `Telegram first name: ${userName || '(not available)'}\nUser gender guidance: ${userGenderGuidance(userName)}\nUse the Telegram name only when natural.\n\nSpread type: ${spreadLabel}\n\nUser's question:\n"${question.trim()}"${contextBlock}\n\nDrawn spread:\n\n${cardBlock}`;
 
   let response;
   let raw;
@@ -297,6 +344,8 @@ Do not sound like a survey or a sales funnel.
 Do not ask a generic question such as "Что ты чувствуешь?" unless it is clearly made specific by the context.
 Return ONLY the question, with no quotation marks and no extra text.
 
+Omen is a woman and, when referring to herself, always uses feminine grammatical forms.
+User gender guidance: ${userGenderGuidance(userName)}
 Telegram first name: ${userName || '(not available)'}
 Original question: ${originalQuestion}
 Cards:\n${cardBlock}
@@ -910,7 +959,7 @@ Rules:
 - Never invent facts about the user's life.
 - Never claim certainty about the future.
 - Omen is a woman. Always speak about yourself in the feminine grammatical gender in Russian and other languages where grammatical gender applies. For example: «я заметила», «я почувствовала», «я бы сказала», «я подумала». Never use masculine forms when referring to Omen herself.
-- Never infer or mention the user's gender. Use the Telegram first name only when it sounds natural.
+- Use the supplied user gender guidance. If the Telegram name is clearly feminine, address the user in feminine grammatical forms when natural; if clearly masculine, use masculine forms. If the name is ambiguous or a pseudonym, avoid gendered forms where possible; if unavoidable, use masculine as the fallback. Do not invent a gender beyond this guidance. Use the Telegram first name only when it sounds natural.
 - If the user reveals a genuinely new layer that would benefit from another spread, set reading_offer to true and formulate one specific reading_question for that new layer. This is only a signal for the server; NEVER sell, charge, or end the conversation yourself. Do not mention payment, credits, limits or sales inside reply or next_message.
 - If there is no genuinely new layer, continue the conversation naturally around the EXISTING reading.
 - A new user question does NOT automatically mean a new Tarot spread. Never generate or imply a new spread in this stage.
@@ -946,7 +995,7 @@ async function generateConversationResponse({ userName, originalQuestion, cards,
     : '(no previous conversation messages)';
 
   const remainingMessages = Math.max(0, conversationLimit - conversationUsed);
-  const userMessage = `Telegram first name: ${userName || '(not available)'}\n\nSpread type: ${spreadLabel}\n\nOriginal question:\n"${originalQuestion}"\n\nCards from the completed reading:\n${cardBlock}\n\nOriginal interpretation:\n${interpretation}\n\nConversation so far:\n${historyBlock}\n\nLatest user message:\n"${latestMessage}"\n\nConversation allowance: this reply is message ${conversationUsed + 1} of ${conversationLimit}; ${remainingMessages} message(s) remain before the current free conversation window ends. Do not mention this allowance to the user. If a genuinely new layer/question has emerged, prefer setting reading_offer=true so the next spread can become the natural continuation. If no new layer has emerged, do not invent one just to sell a spread.`;
+  const userMessage = `Telegram first name: ${userName || '(not available)'}\nUser gender guidance: ${userGenderGuidance(userName)}\n\nSpread type: ${spreadLabel}\n\nOriginal question:\n"${originalQuestion}"\n\nCards from the completed reading:\n${cardBlock}\n\nOriginal interpretation:\n${interpretation}\n\nConversation so far:\n${historyBlock}\n\nLatest user message:\n"${latestMessage}"\n\nConversation allowance: this reply is message ${conversationUsed + 1} of ${conversationLimit}; ${remainingMessages} message(s) remain before the current free conversation window ends. Do not mention this allowance to the user. If a genuinely new layer/question has emerged, prefer setting reading_offer=true so the next spread can become the natural continuation. If no new layer has emerged, do not invent one just to sell a spread.`;
 
   let lastError;
   let response = null;
