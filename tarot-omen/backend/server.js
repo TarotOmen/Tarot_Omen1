@@ -3062,7 +3062,14 @@ async function processTelegramUpdate(update) {
       console.error('[tarot-omen] Follow-up question generation failed:', followupErr);
     }
 
+    // Starting/completing a free reading must NEVER erase previously purchased
+    // entitlements. Keep the existing paid balances and only replace the current
+    // reading/free-story state. Previously this recreated the whole session with
+    // paidReadingsRemaining/paidCelticRemaining = 0, which made paid packages
+    // disappear after a history reset/new free topic.
+    const previousSession = sessions.get(chatId) || {};
     sessions.set(chatId, {
+      ...previousSession,
       userName,
       reading: {
         question: text,
@@ -3073,20 +3080,17 @@ async function processTelegramUpdate(update) {
       history: [],
       freeConversationUsed: 0,
       paidConversationUsed: 0,
-      paidReadingsRemaining: 0,
-      paidCelticRemaining: 0,
       paidReadingActive: false,
-      paidPackageKind: 'reading',
       pendingGiftReading: false,
       pendingPaidReadingKind: '',
       pendingNewTopic: false,
       pendingNewTopicKind: '',
       newTopicInfoMessageId: 0,
       newTopicInfoPromise: null,
-      paidContinuation: PAID_CONTINUATION_DEFAULT,
       readingOfferShown: false,
       pendingReadingQuestion: '',
       pendingPayment: null,
+      pendingTributePayment: null,
       freeReadingUsed: true,
       freeCooldownUsed: false,
       freeCooldownAvailableAt: Date.now() + FREE_COOLDOWN_MS
