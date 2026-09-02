@@ -1911,6 +1911,43 @@ async function offerCelticPaymentMethods(chatId, messageId) {
   );
 }
 
+async function offerCelticBackOptions(chatId, session, messageId) {
+  const paidReadingAvailable = Number(session?.paidReadingsRemaining || 0) > 0;
+  const paidCelticAvailable = Number(session?.paidCelticRemaining || 0) > 0;
+  const freeAvailable = !!session?.reading &&
+    Date.now() >= Number(session?.freeCooldownAvailableAt || 0);
+
+  if (!paidReadingAvailable && !paidCelticAvailable && !freeAvailable) {
+    await offerPaymentMethods(chatId, messageId);
+    return;
+  }
+
+  const buttons = [];
+  if (paidReadingAvailable || freeAvailable) {
+    buttons.push([{
+      text: '▶️ Продолжить обычные расклады',
+      callback_data: 'continue:ordinary'
+    }]);
+  }
+  if (paidReadingAvailable || paidCelticAvailable || freeAvailable) {
+    buttons.push([{
+      text: '🆕 Начать новый расклад',
+      callback_data: 'new:topic'
+    }]);
+  }
+  buttons.push([{
+    text: '⬅️ Вернуться к выбору расклада',
+    callback_data: 'choose:celtic:back:selection'
+  }]);
+
+  await telegramEditMessageTextWithRetry(
+    chatId,
+    messageId,
+    'Хорошо. Ты вернулся назад. Что хочешь сделать?',
+    buttons
+  );
+}
+
 async function offerPaymentMethods(chatId, messageId) {
   const buttons = buildPaidContinuationButtons();
   const text = 'Выбери расклад и способ оплаты:';
@@ -2528,7 +2565,85 @@ async function processTelegramUpdate(update) {
         if (!session?.reading) {
           throw new Error('Сначала нужен основной расклад.');
         }
+        await offerCelticBackOptions(chatId, session, callback.message?.message_id);
+      } else if (callback.data === 'choose:celtic:back:selection') {
+        if (!session?.reading) {
+          throw new Error('Сначала нужен основной расклад.');
+        }
         await offerPaymentMethods(chatId, callback.message?.message_id);
+      } else if (callback.data === 'continue:ordinary') {
+        if (!session?.reading) {
+          throw new Error('Сначала нужен основной расклад.');
+        }
+        const paidReadingAvailable = Number(session.paidReadingsRemaining || 0) > 0;
+        const freeAvailable = Date.now() >= Number(session.freeCooldownAvailableAt || 0);
+
+        if (paidReadingAvailable) {
+          session.pendingGiftReading = true;
+          session.pendingPaidReadingKind = 'reading';
+          session.pendingReadingQuestion = session.pendingReadingQuestion ||
+            session.reading?.question ||
+            'Посмотреть следующий слой этой истории';
+          await telegramEditMessageTextWithRetry(
+            chatId,
+            callback.message?.message_id,
+            'Продолжаем обычные расклады. Выбери, какой оплаченный расклад использовать:',
+            [[{
+              text: `🃏 Использовать обычный расклад — осталось ${session.paidReadingsRemaining}`,
+              callback_data: 'use:paid:reading'
+            }]]
+          );
+        } else if (freeAvailable) {
+          const continuationQuestion = session.pendingReadingQuestion ||
+            session.reading?.question ||
+            'Посмотреть следующий слой этой истории';
+          const cards = drawThreeCards();
+          await deleteCallbackMessage(callback);
+          await telegramSendMessage(chatId, 'Мешаю карты...', true);
+          await telegramSendShuffleGif(chatId);
+
+          const interpretationPromise = generateInterpretation(
+            continuationQuestion, cards, session.userName || '', 'three', '', chatId
+          );
+          const spreadImage = await buildReadingImage(cards);
+          await telegramSendSpreadImage(chatId, spreadImage);
+          await telegramSendMessage(chatId, CARDS_CAPTION);
+          await sleep(1200);
+          const result = await interpretationPromise;
+          await telegramSendCardText(chatId, result.interpretation, cards);
+
+          try {
+            const followup = await generateFollowupQuestion({
+              userName: session.userName || '',
+              originalQuestion: continuationQuestion,
+              cards,
+              interpretation: result.interpretation
+            });
+            await telegramSendCardText(chatId, followup, cards);
+          } catch (followupErr) {
+            console.error('[tarot-omen] Celtic-back free follow-up generation failed:', followupErr);
+          }
+
+          session.reading = {
+            question: continuationQuestion,
+            cards,
+            interpretation: result.interpretation,
+            spreadType: 'three'
+          };
+          session.history = Array.isArray(session.history) ? session.history.slice(-24) : [];
+          session.freeConversationUsed = 0;
+          session.paidConversationUsed = 0;
+          session.paidReadingActive = false;
+          session.paidContinuation = false;
+          session.pendingReadingQuestion = '';
+          session.readingOfferShown = false;
+          session.pendingGiftReading = false;
+          session.pendingPaidReadingKind = '';
+          session.freeCooldownUsed = false;
+          session.freeCooldownAvailableAt = Date.now() + FREE_COOLDOWN_MS;
+        } else {
+          throw new Error('Для продолжения пока нет доступного обычного расклада.');
+        }
       } else if (callback.data === 'pay:stars:reading') {
         await createPaymentInvoice(chatId, session, 'reading', 'STARS');
         await deleteCallbackMessage(callback);
