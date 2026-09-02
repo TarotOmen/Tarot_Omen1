@@ -17,6 +17,10 @@ const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const OMEN_VOICE_ID = process.env.OMEN_VOICE_ID;
 
+// Private test account: this Telegram username can exercise paid flows without a real payment.
+// Keep this value restricted to the owner's account.
+const ADMIN_TEST_USERNAME = 'flash_royalevich';
+
 const TRIBUTE_API_KEY = process.env.TRIBUTE_API_KEY;
 const TRIBUTE_API_URL = process.env.TRIBUTE_API_URL || 'https://tribute.tg/api/v1';
 const TELEGRAM_WEBHOOK_URL =
@@ -50,6 +54,18 @@ app.use(cors({ origin: ALLOWED_ORIGIN }));
 const hits = new Map();
 const WINDOW_MS = 10 * 60 * 1000;
 const MAX_HITS = 12;
+
+function isAdminTestUser(telegramUser) {
+  const username = String(telegramUser?.username || '').trim().replace(/^@/, '').toLowerCase();
+  return username === ADMIN_TEST_USERNAME;
+}
+
+function ensureAdminTestEntitlement(session) {
+  if (!session) return;
+  if (!hasPaidEntitlements(session)) {
+    activatePaidPackage(session, 'reading');
+  }
+}
 
 function rateLimited(key) {
   const now = Date.now();
@@ -1394,7 +1410,7 @@ async function telegramSendShuffleGifWithRetry(chatId, attempts = 5) {
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await telegramSendShuffleGifWithRetry(chatId);
+      return await telegramSendShuffleGif(chatId);
     } catch (err) {
       lastError = err;
       console.error(`[tarot-omen] Shuffle GIF delivery attempt ${attempt}/${attempts} failed:`, err?.message || err);
@@ -2096,6 +2112,41 @@ async function telegramAnswerPreCheckoutQuery(queryId, ok, errorMessage = '') {
 }
 
 
+async function simulateAdminPayment(chatId, session, kind) {
+  if (!session?.reading) {
+    await telegramSendMessage(chatId, 'Сначала нужен расклад, с которого начнём эту историю.');
+    return;
+  }
+
+  const safeKind = kind === 'celtic' ? 'celtic' : 'reading';
+  session.pendingPayment = null;
+  session.pendingTributePayment = null;
+  activatePaidPackage(session, safeKind);
+
+  if (safeKind === 'celtic') {
+    await telegramSendMessage(
+      chatId,
+      'Оплата прошла. У тебя 1 Кельтский крест и 2 обычных расклада в подарок. Запускаю Кельтский крест — 10 карт и подробный разбор.'
+    );
+    await runPaidCelticReading(
+      chatId,
+      session,
+      session.pendingReadingQuestion || session.reading.question
+    );
+    return;
+  }
+
+  await telegramSendMessage(
+    chatId,
+    'Оплата прошла. У тебя 5 обычных раскладов: 3 входят в пакет и ещё 2 — в подарок. Начинаем первый.'
+  );
+  await runPaidThreeCardReading(
+    chatId,
+    session,
+    session.pendingReadingQuestion || session.reading.question
+  );
+}
+
 async function createPaymentInvoice(chatId, session, kind, currency = 'STARS', paymentMethod = '') {
   if (!session?.reading) {
     await telegramSendMessage(chatId, 'Сначала нужен расклад, с которого начнём эту историю.');
@@ -2470,16 +2521,32 @@ async function processTelegramUpdate(update) {
         }
         await offerPaymentMethods(chatId, callback.message?.message_id);
       } else if (callback.data === 'pay:stars:reading') {
-        await createPaymentInvoice(chatId, session, 'reading', 'STARS');
+        if (isAdminTestUser(callback.from)) {
+          await simulateAdminPayment(chatId, session, 'reading');
+        } else {
+          await createPaymentInvoice(chatId, session, 'reading', 'STARS');
+        }
         await deleteCallbackMessage(callback);
       } else if (callback.data === 'pay:stars:celtic') {
-        await createPaymentInvoice(chatId, session, 'celtic', 'STARS');
+        if (isAdminTestUser(callback.from)) {
+          await simulateAdminPayment(chatId, session, 'celtic');
+        } else {
+          await createPaymentInvoice(chatId, session, 'celtic', 'STARS');
+        }
         await deleteCallbackMessage(callback);
       } else if (callback.data === 'pay:tribute:reading') {
-        await createPaymentInvoice(chatId, session, 'reading', 'RUB');
+        if (isAdminTestUser(callback.from)) {
+          await simulateAdminPayment(chatId, session, 'reading');
+        } else {
+          await createPaymentInvoice(chatId, session, 'reading', 'RUB');
+        }
         await deleteCallbackMessage(callback);
       } else if (callback.data === 'pay:tribute:celtic') {
-        await createPaymentInvoice(chatId, session, 'celtic', 'RUB');
+        if (isAdminTestUser(callback.from)) {
+          await simulateAdminPayment(chatId, session, 'celtic');
+        } else {
+          await createPaymentInvoice(chatId, session, 'celtic', 'RUB');
+        }
         await deleteCallbackMessage(callback);
       } else if (callback.data === 'payment:back') {
         if (!session) throw new Error('Сначала нужен расклад.');
@@ -2510,13 +2577,20 @@ async function processTelegramUpdate(update) {
           await runPaidCelticReading(chatId, session, session.reading?.question || 'Посмотреть следующий слой этой истории');
         }
       } else if (callback.data === 'new:topic') {
+        // The owner test account can exercise the new-topic flow even when no
+        // paid entitlement or 72-hour free window is currently available.
+        if (isAdminTestUser(callback.from)) ensureAdminTestEntitlement(session);
         // Keep the payment-choice message and its buttons visible. The new-topic
         // action is intentionally additive, so the user can still return to the
         // same payment choices without losing the explanation above them.
         await handleNewTopicRequest(chatId, session);
       } else if (callback.data === 'pay:reading' || callback.data === 'pay:celtic') {
         const kind = callback.data === 'pay:celtic' ? 'celtic' : 'reading';
-        await createPaymentInvoice(chatId, session, kind, 'STARS');
+        if (isAdminTestUser(callback.from)) {
+          await simulateAdminPayment(chatId, session, kind);
+        } else {
+          await createPaymentInvoice(chatId, session, kind, 'STARS');
+        }
         await deleteCallbackMessage(callback);
       }
     } catch (err) {
