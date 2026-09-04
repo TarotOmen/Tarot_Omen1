@@ -3514,6 +3514,12 @@ async function processTelegramUpdate(update) {
       sessions.get(chatId).telegramUsername = telegramUsername || sessions.get(chatId).telegramUsername || '';
     }
     ensureWorkflowFields(sessions.get(chatId));
+    // /start is a fresh menu entry point. Clear stale input modes so that an
+    // earlier promo/support prompt can never capture the user's next question.
+    // Paid entitlements themselves are preserved.
+    const startSession = sessions.get(chatId);
+    startSession.pendingPromoEntry = false;
+    startSession.pendingSupport = false;
     if (sessions.has(chatId) && isAdminTestUser({ username: telegramUsername })) {
       ensureAdminTestEntitlement(sessions.get(chatId));
     }
@@ -3547,42 +3553,46 @@ async function processTelegramUpdate(update) {
     return;
   }
 
-  // ===== PROMO CODE =====
-  // A recovery code can be entered after pressing the promo button, or directly
-  // in the normal Telegram input field.
-  if (session && (session.pendingPromoEntry || /^OMEN-[A-Z0-9]{5}-[A-Z0-9]{5}$/i.test(text))) {
-    session.pendingPromoEntry = false;
-    try {
-      await handlePromoInput(chatId, session, text);
-    } catch (err) {
-      console.error('[tarot-omen] Promo redemption failed:', err);
-      await telegramSendMessage(chatId, 'Не удалось проверить промокод из-за технической ошибки. Попробуй ещё раз.');
-    }
-    return;
-  }
-
-  // ===== SUPPORT REQUEST =====
-  if (session?.pendingSupport) {
-    session.pendingSupport = false;
-    session.supportActive = true;
-    try {
-      await sendSupportRequest(chatId, session, text);
-    } catch (err) {
-      console.error('[tarot-omen] Support request failed:', err);
-      await telegramSendMessage(chatId, 'Не удалось передать сообщение в техподдержку. Попробуй ещё раз.');
-    }
-    return;
-  }
-
-  // ===== ACTIVE SUPPORT CONVERSATION =====
-  if (session?.supportActive) {
-    try {
-      if (await forwardSupportUserMessage(chatId, text)) return;
-      session.supportActive = false;
-    } catch (err) {
-      console.error('[tarot-omen] Active support forwarding failed:', err);
-      await telegramSendMessage(chatId, 'Не удалось передать сообщение в техподдержку. Попробуй ещё раз.');
+  // ===== PROMO / SUPPORT INPUT MODES =====
+  // Explicit NEW TOPIC mode is handled before these modes below.
+  if (!session?.pendingNewTopic) {
+    // ===== PROMO CODE =====
+    // A recovery code can be entered after pressing the promo button, or directly
+    // in the normal Telegram input field.
+    if (session && (session.pendingPromoEntry || /^OMEN-[A-Z0-9]{5}-[A-Z0-9]{5}$/i.test(text))) {
+      session.pendingPromoEntry = false;
+      try {
+        await handlePromoInput(chatId, session, text);
+      } catch (err) {
+        console.error('[tarot-omen] Promo redemption failed:', err);
+        await telegramSendMessage(chatId, 'Не удалось проверить промокод из-за технической ошибки. Попробуй ещё раз.');
+      }
       return;
+    }
+
+    // ===== SUPPORT REQUEST =====
+    if (session?.pendingSupport) {
+      session.pendingSupport = false;
+      session.supportActive = true;
+      try {
+        await sendSupportRequest(chatId, session, text);
+      } catch (err) {
+        console.error('[tarot-omen] Support request failed:', err);
+        await telegramSendMessage(chatId, 'Не удалось передать сообщение в техподдержку. Попробуй ещё раз.');
+      }
+      return;
+    }
+
+    // ===== ACTIVE SUPPORT CONVERSATION =====
+    if (session?.supportActive) {
+      try {
+        if (await forwardSupportUserMessage(chatId, text)) return;
+        session.supportActive = false;
+      } catch (err) {
+        console.error('[tarot-omen] Active support forwarding failed:', err);
+        await telegramSendMessage(chatId, 'Не удалось передать сообщение в техподдержку. Попробуй ещё раз.');
+        return;
+      }
     }
   }
 
