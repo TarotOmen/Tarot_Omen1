@@ -3054,8 +3054,8 @@ async function runPaidThreeCardReading(chatId, session, question) {
 
 function buildStartPaymentButtons() {
   return [
-    [{ text: '🃏 Обычный расклад', callback_data: 'purchase:reading' }],
-    [{ text: '🔮 Кельтский крест', callback_data: 'purchase:celtic' }],
+    [{ text: '🃏 Купить обычный расклад', callback_data: 'purchase:reading' }],
+    [{ text: '🔮 Купить Кельтский крест', callback_data: 'purchase:celtic' }],
     ...buildSupportButtons()
   ];
 }
@@ -3063,8 +3063,8 @@ function buildStartPaymentButtons() {
 async function offerPurchaseSelection(chatId, session, messageId = null) {
   const text = 'Выбери расклад, который хочешь приобрести:';
   const buttons = [
-    [{ text: '🃏 Обычный расклад', callback_data: 'purchase:reading' }],
-    [{ text: '🔮 Кельтский крест', callback_data: 'purchase:celtic' }],
+    [{ text: '🃏 Купить обычный расклад', callback_data: 'purchase:reading' }],
+    [{ text: '🔮 Купить Кельтский крест', callback_data: 'purchase:celtic' }],
     ...buildSupportButtons(),
     [{ text: '⬅️ Назад', callback_data: 'menu:back' }]
   ];
