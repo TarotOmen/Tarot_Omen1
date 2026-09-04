@@ -2295,17 +2295,7 @@ async function offerPaidContinuation(chatId, session, readingQuestion = '', mess
 }
 
 async function offerCelticPaymentMethods(chatId, messageId) {
-  await telegramEditMessageTextWithRetry(
-    chatId,
-    messageId,
-    'Кельтский крест — 10 карт. Выбери способ оплаты:',
-    [
-      [{ text: `⭐ Telegram Stars — ${CELTIC_CROSS_STARS}`, callback_data: 'pay:stars:celtic' }],
-      [{ text: `💳 Карта / СБП — ${TRIBUTE_CELTIC_RUB} ₽`, callback_data: 'pay:tribute:celtic' }],
-      ...buildSupportButtons(),
-      [{ text: '⬅️ Вернуться к выбору расклада', callback_data: 'choose:celtic:back' }]
-    ]
-  );
+  await offerPurchasePaymentMethods(chatId, 'celtic', messageId);
 }
 
 async function offerCelticBackOptions(chatId, session, messageId) {
@@ -2347,36 +2337,11 @@ async function offerCelticBackOptions(chatId, session, messageId) {
 }
 
 async function offerPaymentMethods(chatId, messageId) {
-  const buttons = buildPaidContinuationButtons();
-  const text = 'Выбери расклад и способ оплаты:';
-  if (messageId) {
-    await telegramEditMessageTextWithRetry(chatId, messageId, text, buttons);
-  } else {
-    await telegramSendInlineKeyboardWithRetry(chatId, text, buttons);
-  }
+  await offerPurchaseSelection(chatId, null, messageId);
 }
 
 async function offerCelticPurchase(chatId, messageId) {
-  const text = [
-    '🔮 Кельтский крест — более глубокое исследование твоего вопроса.',
-    '',
-    'После покупки ты получишь 1 Кельтский крест из 10 карт и ещё 2 обычных расклада «3 карты» в подарок.',
-    '',
-    'Все купленные расклады суммируются и не сгорают — уже имеющиеся останутся у тебя, а новые добавятся к ним.'
-  ].join('\n');
-
-  const buttons = [
-    [{ text: `⭐ Telegram Stars — ${CELTIC_CROSS_STARS}`, callback_data: 'pay:stars:celtic' }],
-    [{ text: `💳 Карта / СБП — ${TRIBUTE_CELTIC_RUB} ₽`, callback_data: 'pay:tribute:celtic' }],
-    ...buildSupportButtons(),
-    [{ text: '⬅️ Назад к доступным раскладам', callback_data: 'buy:celtic:back' }]
-  ];
-
-  if (messageId) {
-    await telegramEditMessageTextWithRetry(chatId, messageId, text, buttons);
-  } else {
-    await telegramSendInlineKeyboardWithRetry(chatId, text, buttons);
-  }
+  await offerPurchasePaymentMethods(chatId, 'celtic', messageId);
 }
 
 async function offerAvailablePaidReadings(chatId, session, messageId = null) {
@@ -2816,7 +2781,8 @@ async function offerPaidTopicChoice(chatId, session, messageId = null) {
   const text = `Ты выбрал ${label}. Теперь выбери, как его использовать:`;
   const buttons = [
     [{ text: '🆕 Начать новый расклад', callback_data: 'paidtopic:new' }],
-    [{ text: '▶️ Продолжить расклад на эту же тему', callback_data: 'paidtopic:continue' }]
+    [{ text: '▶️ Продолжить расклад на эту же тему', callback_data: 'paidtopic:continue' }],
+    [{ text: '⬅️ Назад к доступным раскладам', callback_data: 'paidtopic:back' }]
   ];
   if (messageId) await telegramEditMessageTextWithRetry(chatId, messageId, text, buttons);
   else await telegramSendInlineKeyboardWithRetry(chatId, text, buttons);
@@ -3088,12 +3054,44 @@ async function runPaidThreeCardReading(chatId, session, question) {
 
 function buildStartPaymentButtons() {
   return [
-    [{ text: `⭐ Обычный — ${PAID_READING_STARS} Stars`, callback_data: 'pay:stars:reading' }],
-    [{ text: `💳 Обычный — ${TRIBUTE_READING_RUB} ₽`, callback_data: 'pay:tribute:reading' }],
-    [{ text: `🔮 Кельтский крест — ${CELTIC_CROSS_STARS} Stars`, callback_data: 'pay:stars:celtic' }],
-    [{ text: `💳 Кельтский крест — ${TRIBUTE_CELTIC_RUB} ₽`, callback_data: 'pay:tribute:celtic' }],
+    [{ text: '🃏 Обычный расклад', callback_data: 'purchase:reading' }],
+    [{ text: '🔮 Кельтский крест', callback_data: 'purchase:celtic' }],
     ...buildSupportButtons()
   ];
+}
+
+async function offerPurchaseSelection(chatId, session, messageId = null) {
+  const text = 'Выбери расклад, который хочешь приобрести:';
+  const buttons = [
+    [{ text: '🃏 Обычный расклад', callback_data: 'purchase:reading' }],
+    [{ text: '🔮 Кельтский крест', callback_data: 'purchase:celtic' }],
+    ...buildSupportButtons(),
+    [{ text: '⬅️ Назад', callback_data: 'menu:back' }]
+  ];
+  if (messageId) await telegramEditMessageTextWithRetry(chatId, messageId, text, buttons);
+  else await telegramSendInlineKeyboardWithRetry(chatId, text, buttons);
+}
+
+async function offerPurchasePaymentMethods(chatId, kind, messageId = null) {
+  const isCeltic = kind === 'celtic';
+  const text = isCeltic
+    ? '🔮 Кельтский крест — 10 карт. Выбери способ оплаты:'
+    : '🃏 Обычный расклад «3 карты». Выбери способ оплаты:';
+  const buttons = isCeltic
+    ? [
+        [{ text: `⭐ Telegram Stars — ${CELTIC_CROSS_STARS}`, callback_data: 'pay:stars:celtic' }],
+        [{ text: `💳 Карта / СБП — ${TRIBUTE_CELTIC_RUB} ₽`, callback_data: 'pay:tribute:celtic' }],
+        ...buildSupportButtons(),
+        [{ text: '⬅️ Назад к выбору расклада', callback_data: 'purchase:back' }]
+      ]
+    : [
+        [{ text: `⭐ Telegram Stars — ${PAID_READING_STARS}`, callback_data: 'pay:stars:reading' }],
+        [{ text: `💳 Карта / СБП — ${TRIBUTE_READING_RUB} ₽`, callback_data: 'pay:tribute:reading' }],
+        ...buildSupportButtons(),
+        [{ text: '⬅️ Назад к выбору расклада', callback_data: 'purchase:back' }]
+      ];
+  if (messageId) await telegramEditMessageTextWithRetry(chatId, messageId, text, buttons);
+  else await telegramSendInlineKeyboardWithRetry(chatId, text, buttons);
 }
 
 async function sendStartMessage(chatId, session = null) {
@@ -3118,13 +3116,7 @@ async function sendStartMessage(chatId, session = null) {
     }]);
   }
 
-  buttons.push(
-    [{ text: `⭐ Обычный — ${PAID_READING_STARS} Stars`, callback_data: 'pay:stars:reading' }],
-    [{ text: `💳 Обычный — ${TRIBUTE_READING_RUB} ₽`, callback_data: 'pay:tribute:reading' }],
-    [{ text: `🔮 Кельтский крест — ${CELTIC_CROSS_STARS} Stars`, callback_data: 'pay:stars:celtic' }],
-    [{ text: `💳 Кельтский крест — ${TRIBUTE_CELTIC_RUB} ₽`, callback_data: 'pay:tribute:celtic' }],
-    ...buildSupportButtons()
-  );
+  buttons.push(...buildStartPaymentButtons());
 
   const text = ordinary > 0 || celtic > 0
     ? `Задавай свой вопрос\n\n${buildEntitlementSummary(session)}\n\nВыбери расклад или способ оплаты:`
@@ -3155,33 +3147,24 @@ async function processTelegramUpdate(update) {
     const session = sessions.get(chatId);
     if (session && callback.from?.username) session.telegramUsername = String(callback.from.username).trim();
     try {
-      if (callback.data === 'buy:celtic') {
-        if (!session?.reading) {
-          throw new Error('Сначала нужен основной расклад.');
-        }
-        await offerCelticPurchase(chatId, callback.message?.message_id);
+      if (callback.data === 'purchase:reading') {
+        await offerPurchasePaymentMethods(chatId, 'reading', callback.message?.message_id);
+      } else if (callback.data === 'purchase:celtic') {
+        await offerPurchasePaymentMethods(chatId, 'celtic', callback.message?.message_id);
+      } else if (callback.data === 'purchase:back') {
+        await offerPurchaseSelection(chatId, session, callback.message?.message_id);
+      } else if (callback.data === 'menu:back') {
+        await sendStartMessage(chatId, session);
       } else if (callback.data === 'buy:celtic:back') {
-        if (!session?.reading) {
-          throw new Error('Сначала нужен основной расклад.');
-        }
-        await offerCelticBackOptions(chatId, session, callback.message?.message_id);
+        await offerPurchaseSelection(chatId, session, callback.message?.message_id);
       } else if (callback.data === 'choose:celtic:payment') {
-        if (!session?.reading) {
-          throw new Error('Сначала нужен основной расклад.');
-        }
-        await offerCelticPaymentMethods(chatId, callback.message?.message_id);
+        await offerPurchasePaymentMethods(chatId, 'celtic', callback.message?.message_id);
       } else if (callback.data === 'choose:celtic:back') {
-        if (!session?.reading) {
-          throw new Error('Сначала нужен основной расклад.');
-        }
-        await offerCelticBackOptions(chatId, session, callback.message?.message_id);
+        await offerPurchaseSelection(chatId, session, callback.message?.message_id);
       } else if (callback.data === 'choose:celtic:back:selection') {
-        if (!session?.reading) {
-          throw new Error('Сначала нужен основной расклад.');
-        }
-        await offerPaymentMethods(chatId, callback.message?.message_id);
+        await offerPurchaseSelection(chatId, session, callback.message?.message_id);
       } else if (callback.data === 'payment:open') {
-        await offerPaymentMethods(chatId, callback.message?.message_id);
+        await offerPurchaseSelection(chatId, session, callback.message?.message_id);
       } else if (callback.data === 'promo:enter') {
         if (!session) throw new Error('Сначала нужен расклад.');
         ensureWorkflowFields(session);
@@ -3310,7 +3293,7 @@ async function processTelegramUpdate(update) {
           session.pendingTributePayment = null;
         }
         await deleteCallbackMessage(callback);
-        await offerPaymentMethods(chatId, null);
+        await offerPurchaseSelection(chatId, session, null);
       } else if (callback.data === 'select:paid:reading') {
         if (session?.paidReadingsRemaining > 0) {
           session.pendingNewTopic = false;
@@ -3334,6 +3317,11 @@ async function processTelegramUpdate(update) {
           session.pendingPaidReadingKind = 'celtic';
           await offerPaidTopicChoice(chatId, session, callback.message?.message_id);
         }
+      } else if (callback.data === 'paidtopic:back') {
+        session.pendingPaidTopicChoice = false;
+        session.pendingGiftReading = false;
+        session.pendingPaidReadingKind = '';
+        await offerAvailablePaidReadings(chatId, session, callback.message?.message_id);
       } else if (callback.data === 'paidtopic:continue') {
         const kind = session?.pendingPaidReadingKind;
         if (!session || !session.reading || !['reading', 'celtic'].includes(kind)) throw new Error('Сначала выбери доступный расклад.');
