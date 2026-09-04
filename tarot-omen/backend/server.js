@@ -2387,13 +2387,13 @@ async function offerAvailablePaidReadings(chatId, session, messageId = null) {
 
   if (ordinary > 0) {
     buttons.push([{
-      text: `🃏 Использовать обычный расклад — осталось ${ordinary}`,
+      text: `🃏 Обычный расклад — ${ordinary} шт.`,
       callback_data: 'select:paid:reading'
     }]);
   }
   if (celtic > 0) {
     buttons.push([{
-      text: `🔮 Использовать Кельтский крест — осталось ${celtic}`,
+      text: `🔮 Кельтский крест — ${celtic} шт.`,
       callback_data: 'select:paid:celtic'
     }]);
   }
@@ -3107,13 +3107,13 @@ async function sendStartMessage(chatId, session = null) {
   // payment methods for both products, even when the user has no reading yet.
   if (ordinary > 0) {
     buttons.push([{
-      text: `🃏 Использовать обычный расклад — осталось ${ordinary}`,
+      text: `🃏 Обычный расклад — ${ordinary} шт.`,
       callback_data: 'select:paid:reading'
     }]);
   }
   if (celtic > 0) {
     buttons.push([{
-      text: `🔮 Использовать Кельтский крест — осталось ${celtic}`,
+      text: `🔮 Кельтский крест — ${celtic} шт.`,
       callback_data: 'select:paid:celtic'
     }]);
   }
