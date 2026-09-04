@@ -3086,20 +3086,53 @@ async function runPaidThreeCardReading(chatId, session, question) {
   }
 }
 
-async function sendStartMessage(chatId) {
-  const response = await fetch(`${TELEGRAM_API}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: chatId,
-      text: 'Задавай свой вопрос',
-      reply_markup: { inline_keyboard: buildSupportButtons() }
-    })
-  });
-  if (!response.ok) {
-    throw new Error(`Telegram start message failed: ${await response.text()}`);
-  }
+function buildStartPaymentButtons() {
+  return [
+    [{ text: `⭐ Обычный — ${PAID_READING_STARS} Stars`, callback_data: 'pay:stars:reading' }],
+    [{ text: `💳 Обычный — ${TRIBUTE_READING_RUB} ₽`, callback_data: 'pay:tribute:reading' }],
+    [{ text: `🔮 Кельтский крест — ${CELTIC_CROSS_STARS} Stars`, callback_data: 'pay:stars:celtic' }],
+    [{ text: `💳 Кельтский крест — ${TRIBUTE_CELTIC_RUB} ₽`, callback_data: 'pay:tribute:celtic' }],
+    ...buildSupportButtons()
+  ];
 }
+
+async function sendStartMessage(chatId, session = null) {
+  ensureWorkflowFields(session);
+
+  const ordinary = Number(session?.paidReadingsRemaining || 0);
+  const celtic = Number(session?.paidCelticRemaining || 0);
+  const buttons = [];
+
+  // /start is a menu entry point, not a state reset. Always expose both
+  // payment methods for both products, even when the user has no reading yet.
+  if (ordinary > 0) {
+    buttons.push([{
+      text: `🃏 Использовать обычный расклад — осталось ${ordinary}`,
+      callback_data: 'select:paid:reading'
+    }]);
+  }
+  if (celtic > 0) {
+    buttons.push([{
+      text: `🔮 Использовать Кельтский крест — осталось ${celtic}`,
+      callback_data: 'select:paid:celtic'
+    }]);
+  }
+
+  buttons.push(
+    [{ text: `⭐ Обычный — ${PAID_READING_STARS} Stars`, callback_data: 'pay:stars:reading' }],
+    [{ text: `💳 Обычный — ${TRIBUTE_READING_RUB} ₽`, callback_data: 'pay:tribute:reading' }],
+    [{ text: `🔮 Кельтский крест — ${CELTIC_CROSS_STARS} Stars`, callback_data: 'pay:stars:celtic' }],
+    [{ text: `💳 Кельтский крест — ${TRIBUTE_CELTIC_RUB} ₽`, callback_data: 'pay:tribute:celtic' }],
+    ...buildSupportButtons()
+  );
+
+  const text = ordinary > 0 || celtic > 0
+    ? `Задавай свой вопрос\n\n${buildEntitlementSummary(session)}\n\nВыбери расклад или способ оплаты:`
+    : 'Задавай свой вопрос\n\nВыбери расклад и способ оплаты:';
+
+  await telegramSendInlineKeyboardWithRetry(chatId, text, buttons);
+}
+
 
 async function processTelegramUpdate(update) {
   if (update?.pre_checkout_query) {
@@ -3484,7 +3517,7 @@ async function processTelegramUpdate(update) {
     if (sessions.has(chatId) && isAdminTestUser({ username: telegramUsername })) {
       ensureAdminTestEntitlement(sessions.get(chatId));
     }
-    await sendStartMessage(chatId);
+    await sendStartMessage(chatId, sessions.get(chatId));
     return;
   }
   if (rateLimited(`tg:${chatId}`)) {
