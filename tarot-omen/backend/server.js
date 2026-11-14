@@ -6,6 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import sharp from 'sharp';
 import { createHmac, timingSafeEqual, randomBytes } from 'node:crypto';
+import { generateFirstMoviePhrases, isFirstMovieLocalTestRequest, validateFirstMoviePhraseRequest } from './firstmovie-phrases.mjs';
 import pg from 'pg';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -481,6 +482,23 @@ app.post('/api/interpret', async (req, res) => {
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// Closed local test endpoint for the FirstMovie AI desktop integration.
+// Production access remains disabled until a dedicated licensing/auth flow is approved.
+app.post('/api/firstmovie/phrases', async (req, res) => {
+  if (!isFirstMovieLocalTestRequest(req)) {
+    return res.status(404).json({ error: 'API доступен только для локального тестирования.' });
+  }
+
+  try {
+    const { topic, count } = validateFirstMoviePhraseRequest(req.body);
+    const phrases = await generateFirstMoviePhrases(topic, count);
+    return res.json({ phrases });
+  } catch (error) {
+    const status = Number.isInteger(error?.status) ? error.status : 502;
+    return res.status(status).json({ error: error?.message || 'Не удалось сгенерировать фразы.' });
+  }
+});
 
 // ===== TAROT DECK =====
 
