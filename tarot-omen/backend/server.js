@@ -964,6 +964,9 @@ async function initDatabase() {
   }
 
   dbReady = true;
+  for (const [chatId, session] of sessions.entries()) {
+    scheduleFreeReadingNotification(chatId, session);
+  }
   console.log(`[tarot-omen] PostgreSQL ready. Restored ${result.rowCount} sessions and ${events.rowCount} processed payment events.`);
 }
 
@@ -1072,7 +1075,11 @@ function isFreeReadingAvailable(chatId, session) {
   if (session.freeReadingAvailable === true) return true;
 
   const availableAt = Number(session.freeCooldownAvailableAt || 0);
-  return !!availableAt && Date.now() >= availableAt;
+  if (availableAt) return Date.now() >= availableAt;
+
+  // A new user gets one free reading. Existing users with a reading or a used
+  // free entitlement must wait for the stored 72-hour deadline.
+  return session.freeReadingUsed === false && !session.reading;
 }
 
 function scheduleFreeReadingNotification(chatId, session = sessions.get(chatId)) {
@@ -2445,8 +2452,7 @@ async function handleNewTopicRequest(chatId, session) {
 
   const paidReadingAvailable = Number(session.paidReadingsRemaining || 0) > 0;
   const paidCelticAvailable = Number(session.paidCelticRemaining || 0) > 0;
-  const freeAvailable = !!session.reading &&
-    Date.now() >= Number(session.freeCooldownAvailableAt || 0);
+  const freeAvailable = isFreeReadingAvailable(chatId, session);
 
   if (paidReadingAvailable || paidCelticAvailable) {
     const preferredKind = paidReadingAvailable ? 'reading' : 'celtic';
@@ -3101,6 +3107,13 @@ async function sendStartMessage(chatId, session = null) {
   const celtic = Number(session?.paidCelticRemaining || 0);
   const buttons = [];
 
+  if (isFreeReadingAvailable(chatId, session)) {
+    buttons.push([{
+      text: '🎁 Бесплатный расклад',
+      callback_data: 'free:reading'
+    }]);
+  }
+
   // /start is a menu entry point, not a state reset. Always expose both
   // payment methods for both products, even when the user has no reading yet.
   if (ordinary > 0) {
@@ -3153,6 +3166,8 @@ async function processTelegramUpdate(update) {
         await offerPurchasePaymentMethods(chatId, 'celtic', callback.message?.message_id);
       } else if (callback.data === 'purchase:back') {
         await offerPurchaseSelection(chatId, session, callback.message?.message_id);
+      } else if (callback.data === 'free:reading') {
+        await handleNewTopicRequest(chatId, session);
       } else if (callback.data === 'menu:back') {
         await sendStartMessage(chatId, session);
       } else if (callback.data === 'buy:celtic:back') {
@@ -3650,6 +3665,7 @@ async function processTelegramUpdate(update) {
         session.readingOfferShown = false;
         session.pendingGiftReading = false;
         session.pendingPaidReadingKind = '';
+        session.freeReadingUsed = true;
         armFreeReadingCooldown(chatId, session);
         return;
       }
