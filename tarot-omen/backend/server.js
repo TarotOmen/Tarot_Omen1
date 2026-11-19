@@ -4105,7 +4105,7 @@ async function setupTelegramWebhook() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         url: TELEGRAM_WEBHOOK_URL,
-        drop_pending_updates: true
+        drop_pending_updates: false
       })
     });
 
