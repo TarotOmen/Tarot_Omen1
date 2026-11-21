@@ -618,7 +618,7 @@ function cardSlug(name) {
     "Сила": "strength",
     "Отшельник": "the_hermit",
     "Колесо Фортуны": "wheel_of_fortune",
-    "Справедливость": "justice",
+    "Справедливость": "the_justice",
     "Повешенный": "the_hanged_man",
     "Смерть": "death",
     "Умеренность": "temperance",
@@ -3313,6 +3313,7 @@ async function processTelegramUpdate(update) {
         if (session?.paidReadingsRemaining > 0) {
           session.pendingNewTopic = false;
           session.pendingNewTopicKind = '';
+          session.pendingPaidReadingKind = 'reading';
           await offerPaidTopicChoice(chatId, session, callback.message?.message_id);
         }
       } else if (callback.data === 'select:paid:celtic') {
@@ -3353,7 +3354,14 @@ async function processTelegramUpdate(update) {
         else await runPaidThreeCardReading(chatId, session, question);
       } else if (callback.data === 'paidtopic:new') {
         const kind = session?.pendingPaidReadingKind;
-        if (!session || !['reading', 'celtic'].includes(kind)) throw new Error('Сначала выбери доступный расклад.');
+        if (!session || !['reading', 'celtic'].includes(kind)) {
+          if (session && hasPaidEntitlements(session)) {
+            await offerAvailablePaidReadings(chatId, session, callback.message?.message_id);
+          } else {
+            await telegramSendMessage(chatId, 'Эта кнопка больше неактуальна. Открой доступные расклады и выбери один из них.');
+          }
+          return;
+        }
         if (kind === 'celtic' && Number(session.paidCelticRemaining || 0) <= 0) throw new Error('Кельтских крестов больше нет.');
         if (kind === 'reading' && Number(session.paidReadingsRemaining || 0) <= 0) throw new Error('Обычных раскладов больше нет.');
         session.pendingGiftReading = false;
